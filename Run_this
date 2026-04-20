@@ -1,0 +1,72 @@
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+def stream_output(pipe, prefix):
+    for line in iter(pipe.readline, ''):
+        print(f"[{prefix}] {line}", end='')
+    pipe.close()
+
+def run_scripts():
+    python_exe = sys.executable
+
+    base_dir = Path(__file__).resolve().parent
+    rockets_path = base_dir / "Rockets.py"
+    lakers_path = base_dir / "Lakers.py"
+
+    print("🚀 Starting Rockets.py and Lakers.py in parallel...\n")
+    print(f"Using folder: {base_dir}\n")
+
+    if not rockets_path.exists():
+        print(f"❌ Could not find: {rockets_path}")
+        return
+
+    if not lakers_path.exists():
+        print(f"❌ Could not find: {lakers_path}")
+        return
+
+    try:
+        rockets = subprocess.Popen(
+            [python_exe, "-u", str(rockets_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=base_dir
+        )
+
+        lakers = subprocess.Popen(
+            [python_exe, "-u", str(lakers_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=base_dir
+        )
+
+        rockets_thread = threading.Thread(
+            target=stream_output, args=(rockets.stdout, "ROCKETS")
+        )
+        lakers_thread = threading.Thread(
+            target=stream_output, args=(lakers.stdout, "LAKERS")
+        )
+
+        rockets_thread.start()
+        lakers_thread.start()
+
+        rockets.wait()
+        lakers.wait()
+
+        rockets_thread.join()
+        lakers_thread.join()
+
+        print(f"\n✅ Rockets.py finished with code: {rockets.returncode}")
+        print(f"✅ Lakers.py finished with code: {lakers.returncode}")
+        print("\n🔥 BOTH SCRIPTS COMPLETED")
+
+    except Exception as e:
+        print("❌ Error running scripts:", e)
+
+if __name__ == "__main__":
+    run_scripts()
