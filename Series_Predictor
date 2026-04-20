@@ -1,0 +1,320 @@
+import sqlite3
+from datetime import datetime
+
+from Game_Predictor import load_team_configurations, predict_team
+
+
+RESULTS_DB = "playoff_results.db"
+
+
+def init_db():
+    conn = sqlite3.connect(RESULTS_DB)
+    cur = conn.cursor()
+
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS series (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        team1 TEXT NOT NULL,
+        team2 TEXT NOT NULL,
+        winner TEXT,
+        games INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series_id INTEGER NOT NULL,
+        game_number INTEGER NOT NULL,
+        home_team TEXT NOT NULL,
+        winner TEXT NOT NULL,
+        lakers_score REAL NOT NULL,
+        rockets_score REAL NOT NULL,
+        FOREIGN KEY (series_id) REFERENCES series(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS player_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series_id INTEGER NOT NULL,
+        game_number INTEGER NOT NULL,
+        team TEXT NOT NULL,
+        player TEXT NOT NULL,
+        minutes REAL,
+        points REAL,
+        ast REAL,
+        reb REAL,
+        stl REAL,
+        blk REAL,
+        tov REAL,
+        fg_pct REAL,
+        fg3_pct REAL,
+        ft_pct REAL,
+        FOREIGN KEY (series_id) REFERENCES series(id)
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def create_series(team1: str, team2: str) -> int:
+    conn = sqlite3.connect(RESULTS_DB)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO series (timestamp, team1, team2, winner, games)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (datetime.now().isoformat(timespec="seconds"), team1, team2, "TBD", 0),
+    )
+
+    series_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return series_id
+
+
+def save_game(
+    series_id: int,
+    game_number: int,
+    home_team: str,
+    winner: str,
+    lakers_score: float,
+    rockets_score: float,
+):
+    conn = sqlite3.connect(RESULTS_DB)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO games (
+            series_id, game_number, home_team, winner, lakers_score, rockets_score
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (series_id, game_number, home_team, winner, lakers_score, rockets_score),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_players(series_id: int, game_number: int, team: str, df):
+    if df is None or df.empty:
+        return
+
+    conn = sqlite3.connect(RESULTS_DB)
+    cur = conn.cursor()
+
+    for _, row in df.iterrows():
+        cur.execute(
+            """
+            INSERT INTO player_stats (
+                series_id, game_number, team, player,
+                minutes, points, ast, reb, stl, blk, tov,
+                fg_pct, fg3_pct, ft_pct
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                series_id,
+                game_number,
+                team,
+                row.get("full_name"),
+                float(row.get("numMinutes", 0) or 0),
+                float(row.get("points", 0) or 0),
+                float(row.get("ast", 0) or 0),
+                float(row.get("reb", 0) or 0),
+                float(row.get("stl", 0) or 0),
+                float(row.get("blk", 0) or 0),
+                float(row.get("tov", 0) or 0),
+                float(row.get("fg_pct", 0) or 0),
+                float(row.get("fg3_pct", 0) or 0),
+                float(row.get("ft_pct", 0) or 0),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def finalize_series(series_id: int, winner: str, games_played: int):
+    conn = sqlite3.connect(RESULTS_DB)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE series
+        SET winner = ?, games = ?
+        WHERE id = ?
+        """,
+        (winner, games_played, series_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_series_home_pattern():
+    """
+    2-2-1-1-1 format
+    Lakers = higher seed / home court
+    """
+    return [
+        "Lakers",   # Game 1
+        "Lakers",   # Game 2
+        "Rockets",  # Game 3
+        "Rockets",  # Game 4
+        "Lakers",   # Game 5
+        "Rockets",  # Game 6
+        "Lakers",   # Game 7
+    ]
+
+
+def get_game_adjustments():
+    """
+    Small game-to-game variation for playoff flow.
+    """
+    return [1.00, 0.98, 1.02, 0.99, 1.03, 1.01, 0.97]
+
+
+def print_team_summary(team_name: str, totals: dict):
+    print(
+        f"{team_name} -> "
+        f"PTS {totals['points']:.1f} | "
+        f"AST {totals['ast']:.1f} | "
+        f"REB {totals['reb']:.1f} | "
+        f"STL {totals['stl']:.1f} | "
+        f"BLK {totals['blk']:.1f} | "
+        f"TOV {totals['tov']:.1f}"
+    )
+
+
+def print_top_players(team_name: str, df, top_n: int = 8):
+    print(f"\n{team_name} player predictions:")
+    if df is None or df.empty:
+        print("  No player predictions available.")
+        return
+
+    ordered = df.sort_values(["numMinutes", "points"], ascending=False).head(top_n)
+
+    for _, row in ordered.iterrows():
+        print(
+            f"  {row['full_name']}: "
+            f"MIN {float(row.get('numMinutes', 0)):.1f} | "
+            f"PTS {float(row.get('points', 0)):.1f} | "
+            f"AST {float(row.get('ast', 0)):.1f} | "
+            f"REB {float(row.get('reb', 0)):.1f} | "
+            f"STL {float(row.get('stl', 0)):.1f} | "
+            f"BLK {float(row.get('blk', 0)):.1f} | "
+            f"TOV {float(row.get('tov', 0)):.1f}"
+        )
+
+
+def simulate_series():
+    init_db()
+
+    lakers, rockets = load_team_configurations()
+    series_id = create_series(lakers.name, rockets.name)
+
+    pattern = get_series_home_pattern()
+    game_adjustments = get_game_adjustments()
+
+    lakers_wins = 0
+    rockets_wins = 0
+
+    print("=" * 100)
+    print("SERIES SIMULATION")
+    print("=" * 100)
+    print(f"Series ID: {series_id}")
+    print(f"{lakers.name} vs {rockets.name}")
+
+    for game_num, home in enumerate(pattern, start=1):
+        if lakers_wins == 4 or rockets_wins == 4:
+            break
+
+        print("\n" + "=" * 100)
+        print(f"GAME {game_num}")
+        print("=" * 100)
+
+        lakers_is_home = 1 if home == "Lakers" else 0
+        rockets_is_home = 1 if home == "Rockets" else 0
+        home_team_name = lakers.name if home == "Lakers" else rockets.name
+
+        game_adjustment = game_adjustments[game_num - 1]
+        lakers_adjustment = game_adjustment + (0.015 if lakers_is_home else -0.015)
+        rockets_adjustment = game_adjustment + (0.015 if rockets_is_home else -0.015)
+
+        print(f"Home team: {home_team_name}")
+        print(f"Game adjustment: {game_adjustment:.3f}")
+
+        lakers_players, lakers_totals, _, _ = predict_team(
+            lakers,
+            lakers_is_home,
+            lakers_adjustment,
+        )
+
+        rockets_players, rockets_totals, _, _ = predict_team(
+            rockets,
+            rockets_is_home,
+            rockets_adjustment,
+        )
+
+        lakers_score = float(lakers_totals["points"])
+        rockets_score = float(rockets_totals["points"])
+
+        if lakers_score == rockets_score:
+            if lakers_is_home:
+                lakers_score += 1.0
+                lakers_totals["points"] = round(lakers_score, 1)
+            else:
+                rockets_score += 1.0
+                rockets_totals["points"] = round(rockets_score, 1)
+
+        if lakers_score > rockets_score:
+            winner_full = lakers.name
+            lakers_wins += 1
+        else:
+            winner_full = rockets.name
+            rockets_wins += 1
+
+        print(f"Winner: {winner_full}")
+        print(f"Score: Lakers {lakers_score:.1f} - Rockets {rockets_score:.1f}")
+        print("-" * 100)
+        print_team_summary("Lakers", lakers_totals)
+        print_team_summary("Rockets", rockets_totals)
+        print_top_players("Lakers", lakers_players)
+        print_top_players("Rockets", rockets_players)
+
+        save_game(
+            series_id=series_id,
+            game_number=game_num,
+            home_team=home_team_name,
+            winner=winner_full,
+            lakers_score=lakers_score,
+            rockets_score=rockets_score,
+        )
+
+        save_players(series_id, game_num, "Lakers", lakers_players)
+        save_players(series_id, game_num, "Rockets", rockets_players)
+
+        print("\nSeries standing:")
+        print(f"Lakers {lakers_wins} - Rockets {rockets_wins}")
+
+    final_winner = lakers.name if lakers_wins > rockets_wins else rockets.name
+    games_played = lakers_wins + rockets_wins
+
+    finalize_series(series_id, final_winner, games_played)
+
+    print("\n" + "=" * 100)
+    print("FINAL RESULT")
+    print("=" * 100)
+    print(f"Series winner: {final_winner}")
+    print(f"Final series score: Lakers {lakers_wins} - Rockets {rockets_wins}")
+    print(f"Series length: {games_played} games")
+    print(f"Saved to database: {RESULTS_DB}")
+    print(f"Series ID: {series_id}")
+
+
+if __name__ == "__main__":
+    simulate_series()
