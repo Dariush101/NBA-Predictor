@@ -1,0 +1,1270 @@
+import sqlite3
+import math
+import datetime as dt
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import playernextngames
+
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+
+DB_PATH = "nba_database.db"
+TABLE = "player_game_logs"
+PLAYER_NAMES = ["LeBron James", "Rui Hachimura"]
+
+
+# =========================================================
+# DATABASE / LOAD HELPERS
+# =========================================================
+
+def load_player(player_name: str):
+    conn = sqlite3.connect(DB_PATH)
+
+    query = f"""
+    SELECT
+        season,
+        game_date,
+        matchup,
+        wl,
+        numMinutes,
+        points,
+        ast,
+        reb,
+        stl,
+        blk,
+        tov,
+        fg_pct,
+        fg3_pct,
+        ft_pct,
+        plus_minus,
+        tm_points_total,
+        tm_ast_total,
+        tm_reb_total,
+        tm_minutes_total,
+        tm_fg_pct,
+        top_tm_points,
+        second_tm_points,
+        third_tm_points,
+        top3_tm_points_total,
+        player_team_points_share
+    FROM {TABLE}
+    WHERE full_name = ?
+    ORDER BY game_date
+    """
+
+    df = pd.read_sql_query(query, conn, params=(player_name,))
+    conn.close()
+
+    numeric_cols = [
+        "numMinutes", "points", "ast", "reb", "stl",
+        "blk", "tov", "fg_pct", "fg3_pct", "ft_pct", "plus_minus",
+        "tm_points_total", "tm_ast_total", "tm_reb_total", "tm_minutes_total", "tm_fg_pct",
+        "top_tm_points", "second_tm_points", "third_tm_points",
+        "top3_tm_points_total", "player_team_points_share"
+    ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = df.dropna(subset=["game_date", "numMinutes", "points", "ast", "reb", "matchup"])
+    df = df.sort_values("game_date").reset_index(drop=True)
+
+    return df
+
+
+def add_playoff_flag(df):
+    df = df.copy()
+
+    # Assumption:
+    # if the season text contains "playoff", treat it as a playoff row.
+    # If your DB stores only season years like 2024-25, then all rows become 0
+    # unless you add a dedicated season_type column later.
+    df["is_playoff"] = df["season"].astype(str).str.contains("playoff", case=False, na=False).astype(int)
+
+    return df
+
+
+def extract_opponent(matchup: str):
+    matchup = str(matchup).strip()
+
+    if "vs." in matchup:
+        return matchup.split("vs.")[-1].strip(), 1
+    if "@" in matchup:
+        return matchup.split("@")[-1].strip(), 0
+
+    return None, None
+
+
+def add_basic_context(df):
+    df = df.copy()
+
+    extracted = df["matchup"].apply(extract_opponent)
+    df["opponent"] = extracted.apply(lambda x: x[0])
+    df["is_home"] = extracted.apply(lambda x: x[1])
+
+    df = df.dropna(subset=["opponent", "is_home"]).reset_index(drop=True)
+    df["is_home"] = df["is_home"].astype(int)
+
+    return df
+
+
+# =========================================================
+# NEXT GAME DETECTION
+# =========================================================
+
+def get_player_id(full_name: str) -> int:
+    matches = players.find_players_by_full_name(full_name)
+    if not matches:
+        raise ValueError(f"Player '{full_name}' not found.")
+    return int(matches[0]["id"])
+
+
+def get_current_season_string(today=None) -> str:
+    if today is None:
+        today = dt.date.today()
+
+    if today.month >= 7:
+        start_year = today.year
+    else:
+        start_year = today.year - 1
+
+    end_year_short = str(start_year + 1)[-2:]
+    return f"{start_year}-{end_year_short}"
+
+
+def get_team_abbreviation_from_matchup(matchup: str) -> str:
+    matchup = str(matchup).strip()
+
+    if "vs." in matchup:
+        return matchup.split("vs.")[0].strip()
+    if "@" in matchup:
+        return matchup.split("@")[0].strip()
+
+    raise ValueError(f"Could not parse team abbreviation from matchup: {matchup}")
+
+
+def get_player_team_abbreviation_from_db(player_name: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+
+    query = f"""
+    SELECT matchup
+    FROM {TABLE}
+    WHERE full_name = ?
+    ORDER BY game_date DESC
+    LIMIT 1
+    """
+
+    df = pd.read_sql_query(query, conn, params=(player_name,))
+    conn.close()
+
+    if df.empty:
+        raise ValueError(f"Could not determine {player_name}'s team from database.")
+
+    return get_team_abbreviation_from_matchup(df.iloc[0]["matchup"])
+
+
+def get_next_game_from_playernextngames(player_name: str, season=None):
+    if season is None:
+        season = get_current_season_string()
+
+    player_id = get_player_id(player_name)
+    player_team_abbr = get_player_team_abbreviation_from_db(player_name)
+
+    try:
+        df = playernextngames.PlayerNextNGames(
+            player_id=player_id,
+            number_of_games=1,
+            season_all=season,
+            season_type_all_star="Regular Season"
+        ).get_data_frames()[0]
+
+        if df.empty:
+            return None
+
+        row = df.iloc[0]
+        home_abbr = str(row["HOME_TEAM_ABBREVIATION"]).strip()
+        visitor_abbr = str(row["VISITOR_TEAM_ABBREVIATION"]).strip()
+
+        if home_abbr == player_team_abbr:
+            return {
+                "source": "PlayerNextNGames",
+                "game_id": row.get("GAME_ID"),
+                "game_date": row.get("GAME_DATE"),
+                "opponent": visitor_abbr,
+                "is_home": 1,
+                "home_team": home_abbr,
+                "visitor_team": visitor_abbr,
+            }
+
+        if visitor_abbr == player_team_abbr:
+            return {
+                "source": "PlayerNextNGames",
+                "game_id": row.get("GAME_ID"),
+                "game_date": row.get("GAME_DATE"),
+                "opponent": home_abbr,
+                "is_home": 0,
+                "home_team": home_abbr,
+                "visitor_team": visitor_abbr,
+            }
+
+        return None
+
+    except Exception:
+        return None
+
+
+def normalize_schedule_date(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(text[:19], fmt).date()
+        except ValueError:
+            pass
+
+    try:
+        return pd.to_datetime(text).date()
+    except Exception:
+        return None
+
+
+def get_next_game_from_full_schedule(player_name: str, season=None):
+    if season is None:
+        season = get_current_season_string()
+
+    player_team_abbr = get_player_team_abbreviation_from_db(player_name)
+    start_year = season.split("-")[0]
+
+    url = f"https://data.nba.com/data/10s/v2015/json/mobile_teams/nba/{start_year}/league/00_full_schedule.json"
+
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+
+    today = dt.date.today()
+    games = []
+
+    months = data.get("lscd", [])
+    for month_block in months:
+        for game in month_block.get("mscd", {}).get("g", []):
+            game_date = normalize_schedule_date(game.get("gdte"))
+            if game_date is None or game_date < today:
+                continue
+
+            home = str(game.get("h", {}).get("ta", "")).strip()
+            away = str(game.get("v", {}).get("ta", "")).strip()
+
+            if player_team_abbr not in (home, away):
+                continue
+
+            if home == player_team_abbr:
+                opponent = away
+                is_home = 1
+            else:
+                opponent = home
+                is_home = 0
+
+            games.append({
+                "source": "full_schedule_json",
+                "game_id": game.get("gid"),
+                "game_date": game_date.isoformat(),
+                "opponent": opponent,
+                "is_home": is_home,
+                "home_team": home,
+                "visitor_team": away,
+            })
+
+    if not games:
+        return None
+
+    games.sort(key=lambda x: (x["game_date"], x["game_id"] or ""))
+    return games[0]
+
+
+def get_next_game_context(player_name: str, season=None):
+    next_game = get_next_game_from_playernextngames(player_name=player_name, season=season)
+    if next_game is not None:
+        return next_game
+
+    next_game = get_next_game_from_full_schedule(player_name=player_name, season=season)
+    if next_game is not None:
+        return next_game
+
+    print(f"Warning: could not automatically determine {player_name}'s next game.")
+    return None
+
+
+# =========================================================
+# REPORTING / SUMMARIES
+# =========================================================
+
+def build_opponent_summary(df):
+    summary = (
+        df.groupby("opponent")
+        .agg(
+            games=("points", "count"),
+            avg_points=("points", "mean"),
+            median_points=("points", "median"),
+            std_points=("points", "std"),
+            min_points=("points", "min"),
+            max_points=("points", "max"),
+            avg_ast=("ast", "mean"),
+            avg_reb=("reb", "mean"),
+            avg_minutes=("numMinutes", "mean"),
+            fg_pct=("fg_pct", "mean"),
+            wins=("wl", lambda s: (s == "W").sum()),
+            losses=("wl", lambda s: (s == "L").sum())
+        )
+        .reset_index()
+    )
+
+    summary["win_pct"] = np.where(
+        (summary["wins"] + summary["losses"]) > 0,
+        summary["wins"] / (summary["wins"] + summary["losses"]),
+        np.nan
+    )
+
+    return summary.sort_values(["avg_points", "games"], ascending=[False, False]).reset_index(drop=True)
+
+
+def build_regular_vs_playoff_summary(df):
+    summary = (
+        df.groupby("is_playoff")
+        .agg(
+            games=("points", "count"),
+            avg_points=("points", "mean"),
+            median_points=("points", "median"),
+            avg_ast=("ast", "mean"),
+            avg_reb=("reb", "mean"),
+            avg_minutes=("numMinutes", "mean"),
+            avg_fg_pct=("fg_pct", "mean")
+        )
+        .reset_index()
+    )
+
+    summary["game_type"] = summary["is_playoff"].map({0: "Regular Season", 1: "Playoffs"})
+    return summary[[
+        "game_type", "games", "avg_points", "median_points",
+        "avg_ast", "avg_reb", "avg_minutes", "avg_fg_pct"
+    ]]
+
+
+def print_last_games(df, player_name, n=10):
+    print("\n" + "=" * 110)
+    print(f"{player_name.upper()} LAST {n} GAMES")
+    print("=" * 110)
+
+    temp = df.sort_values("game_date", ascending=False).head(n).copy()
+    temp["game_date"] = temp["game_date"].dt.date
+
+    cols = ["game_date", "matchup", "opponent", "points", "ast", "reb", "numMinutes", "wl", "is_playoff"]
+    print(temp[cols].to_string(index=False))
+
+
+def print_opponent_report(summary_df, player_name):
+    print("\n" + "=" * 110)
+    print(f"{player_name.upper()} VS EVERY TEAM")
+    print("=" * 110)
+
+    report = summary_df.copy()
+    numeric_cols = [
+        "avg_points", "median_points", "std_points", "min_points",
+        "max_points", "avg_ast", "avg_reb", "avg_minutes", "fg_pct", "win_pct"
+    ]
+    report[numeric_cols] = report[numeric_cols].round(2)
+
+    print(report.to_string(index=False))
+
+
+def print_regular_vs_playoff_report(summary_df, player_name):
+    print("\n" + "=" * 110)
+    print(f"{player_name.upper()} REGULAR SEASON VS PLAYOFFS")
+    print("=" * 110)
+
+    report = summary_df.copy()
+    numeric_cols = ["avg_points", "median_points", "avg_ast", "avg_reb", "avg_minutes", "avg_fg_pct"]
+    report[numeric_cols] = report[numeric_cols].round(2)
+
+    print(report.to_string(index=False))
+
+
+# =========================================================
+# TREND HELPERS
+# =========================================================
+
+def compute_trend_info(df, days=21):
+    df = df.copy().sort_values("game_date").reset_index(drop=True)
+
+    latest_date = df["game_date"].max()
+    cutoff_date = latest_date - pd.Timedelta(days=days)
+
+    recent_df = df[df["game_date"] >= cutoff_date].copy()
+
+    recent_avg = recent_df["points"].mean() if not recent_df.empty else np.nan
+    overall_avg = df["points"].mean() if not df.empty else np.nan
+    trend_diff = recent_avg - overall_avg if pd.notna(recent_avg) and pd.notna(overall_avg) else np.nan
+
+    if pd.isna(trend_diff):
+        status = "UNKNOWN"
+    elif trend_diff > 2:
+        status = "HOT"
+    elif trend_diff < -2:
+        status = "SLUMP"
+    else:
+        status = "NORMAL"
+
+    return {
+        "recent_avg": recent_avg,
+        "overall_avg": overall_avg,
+        "trend_diff": trend_diff,
+        "status": status,
+        "games_in_window": len(recent_df),
+        "window_days": days,
+    }
+
+
+def compute_regular_vs_playoff_gap(df):
+    regular_df = df[df["is_playoff"] == 0].copy()
+    playoff_df = df[df["is_playoff"] == 1].copy()
+
+    regular_avg = regular_df["points"].mean() if not regular_df.empty else np.nan
+    playoff_avg = playoff_df["points"].mean() if not playoff_df.empty else np.nan
+
+    if pd.notna(regular_avg) and pd.notna(playoff_avg):
+        diff = playoff_avg - regular_avg
+    else:
+        diff = np.nan
+
+    return {
+        "regular_avg": regular_avg,
+        "playoff_avg": playoff_avg,
+        "playoff_minus_regular": diff
+    }
+
+
+def print_trend_info(trend_info, player_name):
+    print("\n" + "=" * 110)
+    print(f"{player_name.upper()} 3-WEEK TREND")
+    print("=" * 110)
+
+    if pd.isna(trend_info["recent_avg"]):
+        print("Not enough data for trend analysis.")
+        return
+
+    print(f"Games in last {trend_info['window_days']} days: {trend_info['games_in_window']}")
+    print(f"Last 3 weeks average points: {trend_info['recent_avg']:.2f}")
+    print(f"Overall average points     : {trend_info['overall_avg']:.2f}")
+    print(f"Trend difference           : {trend_info['trend_diff']:.2f}")
+    print(f"Trend status               : {trend_info['status']}")
+
+
+def print_regular_vs_playoff_gap(gap_info, player_name):
+    print("\n" + "=" * 110)
+    print(f"{player_name.upper()} PLAYOFF EFFECT")
+    print("=" * 110)
+
+    if pd.isna(gap_info["regular_avg"]) or pd.isna(gap_info["playoff_avg"]):
+        print("Not enough playoff data to compare regular season vs playoffs.")
+        return
+
+    print(f"Regular season avg points : {gap_info['regular_avg']:.2f}")
+    print(f"Playoff avg points        : {gap_info['playoff_avg']:.2f}")
+    print(f"Playoff - Regular         : {gap_info['playoff_minus_regular']:.2f}")
+
+
+# =========================================================
+# FEATURE ENGINEERING
+# =========================================================
+
+def add_opponent_history_features(df):
+    df = df.copy().sort_values("game_date").reset_index(drop=True)
+
+    df["opp_games_before"] = 0
+    df["opp_avg_points_before"] = np.nan
+    df["opp_median_points_before"] = np.nan
+    df["opp_std_points_before"] = np.nan
+    df["opp_max_points_before"] = np.nan
+    df["opp_avg_ast_before"] = np.nan
+    df["opp_avg_reb_before"] = np.nan
+    df["opp_avg_minutes_before"] = np.nan
+    df["opp_fg_pct_before"] = np.nan
+
+    for opp in df["opponent"].unique():
+        mask = df["opponent"] == opp
+        sub = df.loc[mask].copy()
+
+        df.loc[mask, "opp_games_before"] = np.arange(len(sub))
+        df.loc[mask, "opp_avg_points_before"] = sub["points"].shift(1).expanding().mean().values
+        df.loc[mask, "opp_median_points_before"] = sub["points"].shift(1).expanding().median().values
+        df.loc[mask, "opp_std_points_before"] = sub["points"].shift(1).expanding().std().values
+        df.loc[mask, "opp_max_points_before"] = sub["points"].shift(1).expanding().max().values
+        df.loc[mask, "opp_avg_ast_before"] = sub["ast"].shift(1).expanding().mean().values
+        df.loc[mask, "opp_avg_reb_before"] = sub["reb"].shift(1).expanding().mean().values
+        df.loc[mask, "opp_avg_minutes_before"] = sub["numMinutes"].shift(1).expanding().mean().values
+        df.loc[mask, "opp_fg_pct_before"] = sub["fg_pct"].shift(1).expanding().mean().values
+
+    return df
+
+
+def add_trend_features(df, days=21):
+    df = df.copy().sort_values("game_date").reset_index(drop=True)
+
+    df["recent_3w_avg"] = np.nan
+    df["season_avg_to_date"] = np.nan
+    df["trend_diff"] = np.nan
+
+    for i in range(len(df)):
+        current_date = df.loc[i, "game_date"]
+        history = df.iloc[:i].copy()
+
+        if history.empty:
+            continue
+
+        cutoff_date = current_date - pd.Timedelta(days=days)
+        recent_history = history[history["game_date"] >= cutoff_date].copy()
+
+        recent_avg = recent_history["points"].mean() if not recent_history.empty else history["points"].mean()
+        season_avg = history["points"].mean()
+        diff = recent_avg - season_avg
+
+        df.loc[i, "recent_3w_avg"] = recent_avg
+        df.loc[i, "season_avg_to_date"] = season_avg
+        df.loc[i, "trend_diff"] = diff
+
+    return df
+
+
+def add_recent_form_features(df):
+    df = df.copy().sort_values("game_date").reset_index(drop=True)
+
+    df["prev_points"] = df["points"].shift(1)
+    df["prev_minutes"] = df["numMinutes"].shift(1)
+    df["prev_ast"] = df["ast"].shift(1)
+    df["prev_reb"] = df["reb"].shift(1)
+    df["prev_stl"] = df["stl"].shift(1)
+    df["prev_blk"] = df["blk"].shift(1)
+    df["prev_tov"] = df["tov"].shift(1)
+    df["prev_fg_pct"] = df["fg_pct"].shift(1)
+    df["prev_fg3_pct"] = df["fg3_pct"].shift(1)
+    df["prev_ft_pct"] = df["ft_pct"].shift(1)
+    df["prev_plus_minus"] = df["plus_minus"].shift(1)
+
+    df["avg_points_3"] = df["points"].shift(1).rolling(3).mean()
+    df["avg_points_5"] = df["points"].shift(1).rolling(5).mean()
+    df["avg_minutes_3"] = df["numMinutes"].shift(1).rolling(3).mean()
+    df["avg_ast_3"] = df["ast"].shift(1).rolling(3).mean()
+    df["avg_reb_3"] = df["reb"].shift(1).rolling(3).mean()
+    df["avg_fg_pct_3"] = df["fg_pct"].shift(1).rolling(3).mean()
+
+    df["prev_tm_points_total"] = df["tm_points_total"].shift(1)
+    df["prev_tm_ast_total"] = df["tm_ast_total"].shift(1)
+    df["prev_tm_reb_total"] = df["tm_reb_total"].shift(1)
+    df["prev_tm_minutes_total"] = df["tm_minutes_total"].shift(1)
+    df["prev_tm_fg_pct"] = df["tm_fg_pct"].shift(1)
+
+    df["avg_tm_points_3"] = df["tm_points_total"].shift(1).rolling(3).mean()
+    df["avg_tm_points_5"] = df["tm_points_total"].shift(1).rolling(5).mean()
+    df["avg_tm_ast_3"] = df["tm_ast_total"].shift(1).rolling(3).mean()
+    df["avg_tm_reb_3"] = df["tm_reb_total"].shift(1).rolling(3).mean()
+    df["avg_tm_minutes_3"] = df["tm_minutes_total"].shift(1).rolling(3).mean()
+    df["avg_tm_fg_pct_3"] = df["tm_fg_pct"].shift(1).rolling(3).mean()
+
+    df["team_avg_points_3"] = df["tm_points_total"].shift(1).rolling(3).mean()
+    df["team_avg_points_5"] = df["tm_points_total"].shift(1).rolling(5).mean()
+
+    df["prev_top_tm_points"] = df["top_tm_points"].shift(1)
+    df["prev_second_tm_points"] = df["second_tm_points"].shift(1)
+    df["prev_third_tm_points"] = df["third_tm_points"].shift(1)
+    df["prev_top3_tm_points_total"] = df["top3_tm_points_total"].shift(1)
+    df["prev_player_team_points_share"] = df["player_team_points_share"].shift(1)
+
+    df["avg_top_tm_points_3"] = df["top_tm_points"].shift(1).rolling(3).mean()
+    df["avg_second_tm_points_3"] = df["second_tm_points"].shift(1).rolling(3).mean()
+    df["avg_third_tm_points_3"] = df["third_tm_points"].shift(1).rolling(3).mean()
+    df["avg_top3_tm_points_total_3"] = df["top3_tm_points_total"].shift(1).rolling(3).mean()
+    df["avg_player_team_points_share_3"] = df["player_team_points_share"].shift(1).rolling(3).mean()
+    df["player_usage_trend_3"] = df["player_team_points_share"].shift(1).rolling(3).mean()
+
+    # playoff-aware features
+    df["prev_is_playoff"] = df["is_playoff"].shift(1)
+    df["playoff_points_boost"] = df["points"].shift(1) * df["is_playoff"]
+    df["playoff_minutes_boost"] = df["numMinutes"].shift(1) * df["is_playoff"]
+    df["playoff_usage_boost"] = df["player_team_points_share"].shift(1) * df["is_playoff"]
+    df["avg_playoff_points_3"] = (
+        df["points"].shift(1).where(df["is_playoff"].shift(1) == 1).rolling(3).mean()
+    )
+
+    return df
+
+
+def finalize_feature_table(df):
+    df = df.copy().sort_values("game_date").reset_index(drop=True)
+
+    opponent_fill_cols = [
+        "opp_avg_points_before",
+        "opp_median_points_before",
+        "opp_std_points_before",
+        "opp_max_points_before",
+        "opp_avg_ast_before",
+        "opp_avg_reb_before",
+        "opp_avg_minutes_before",
+        "opp_fg_pct_before",
+    ]
+
+    for col in opponent_fill_cols:
+        if "points" in col:
+            df[col] = df[col].fillna(df["points"].expanding().mean())
+        elif "ast" in col:
+            df[col] = df[col].fillna(df["ast"].expanding().mean())
+        elif "reb" in col:
+            df[col] = df[col].fillna(df["reb"].expanding().mean())
+        elif "minutes" in col:
+            df[col] = df[col].fillna(df["numMinutes"].expanding().mean())
+        elif "fg_pct" in col:
+            df[col] = df[col].fillna(df["fg_pct"].expanding().mean())
+        else:
+            df[col] = df[col].fillna(0)
+
+    trend_fill_cols = [
+        "recent_3w_avg",
+        "season_avg_to_date",
+        "trend_diff",
+        "avg_playoff_points_3",
+    ]
+
+    for col in trend_fill_cols:
+        if col in ("recent_3w_avg", "season_avg_to_date", "avg_playoff_points_3"):
+            df[col] = df[col].fillna(df["points"].expanding().mean())
+        else:
+            df[col] = df[col].fillna(0)
+
+    df["opp_std_points_before"] = df["opp_std_points_before"].fillna(0)
+    df["opp_games_before"] = df["opp_games_before"].fillna(0)
+    df["prev_is_playoff"] = df["prev_is_playoff"].fillna(0)
+    df["playoff_points_boost"] = df["playoff_points_boost"].fillna(0)
+    df["playoff_minutes_boost"] = df["playoff_minutes_boost"].fillna(0)
+    df["playoff_usage_boost"] = df["playoff_usage_boost"].fillna(0)
+
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+
+def get_feature_columns():
+    return [
+        "is_home",
+        "is_playoff",
+        "prev_is_playoff",
+
+        "prev_points",
+        "prev_minutes",
+        "prev_ast",
+        "prev_reb",
+        "prev_stl",
+        "prev_blk",
+        "prev_tov",
+        "prev_fg_pct",
+        "prev_fg3_pct",
+        "prev_ft_pct",
+        "prev_plus_minus",
+
+        "avg_points_3",
+        "avg_points_5",
+        "avg_minutes_3",
+        "avg_ast_3",
+        "avg_reb_3",
+        "avg_fg_pct_3",
+
+        "prev_tm_points_total",
+        "prev_tm_ast_total",
+        "prev_tm_reb_total",
+        "prev_tm_minutes_total",
+        "prev_tm_fg_pct",
+        "avg_tm_points_3",
+        "avg_tm_points_5",
+        "avg_tm_ast_3",
+        "avg_tm_reb_3",
+        "avg_tm_minutes_3",
+        "avg_tm_fg_pct_3",
+
+        "team_avg_points_3",
+        "team_avg_points_5",
+
+        "prev_top_tm_points",
+        "prev_second_tm_points",
+        "prev_third_tm_points",
+        "prev_top3_tm_points_total",
+        "prev_player_team_points_share",
+        "avg_top_tm_points_3",
+        "avg_second_tm_points_3",
+        "avg_third_tm_points_3",
+        "avg_top3_tm_points_total_3",
+        "avg_player_team_points_share_3",
+        "player_usage_trend_3",
+
+        "opp_games_before",
+        "opp_avg_points_before",
+        "opp_median_points_before",
+        "opp_std_points_before",
+        "opp_max_points_before",
+        "opp_avg_ast_before",
+        "opp_avg_reb_before",
+        "opp_avg_minutes_before",
+        "opp_fg_pct_before",
+
+        "recent_3w_avg",
+        "season_avg_to_date",
+        "trend_diff",
+
+        "playoff_points_boost",
+        "playoff_minutes_boost",
+        "playoff_usage_boost",
+        "avg_playoff_points_3",
+    ]
+
+
+# =========================================================
+# MODEL HELPERS
+# =========================================================
+
+def get_models():
+    models = {
+        "Random Forest": RandomForestRegressor(
+            n_estimators=300,
+            max_depth=6,
+            random_state=42
+        ),
+        "Gradient Boosting": GradientBoostingRegressor(
+            n_estimators=250,
+            learning_rate=0.03,
+            max_depth=3,
+            random_state=42
+        ),
+        "Extra Trees": ExtraTreesRegressor(
+            n_estimators=300,
+            max_depth=6,
+            random_state=42
+        ),
+        "SVR": Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", SVR(C=10, epsilon=0.2, kernel="rbf"))
+        ])
+    }
+
+    if XGBOOST_AVAILABLE:
+        models["XGBoost"] = XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.03,
+            max_depth=4,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            random_state=42
+        )
+
+    return models
+
+
+def split_train_test(df, feature_cols, target_col="points"):
+    n = len(df)
+    if n < 10:
+        return None
+
+    split_index = max(1, math.floor(n * 0.8))
+    if split_index >= n:
+        split_index = n - 1
+
+    train_df = df.iloc[:split_index].copy()
+    test_df = df.iloc[split_index:].copy()
+
+    X_train = train_df[feature_cols]
+    y_train = train_df[target_col]
+    X_test = test_df[feature_cols]
+    y_test = test_df[target_col]
+
+    return X_train, X_test, y_train, y_test, train_df, test_df
+
+
+def evaluate_model(name, model, X_train, X_test, y_train, y_test):
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+
+    mse = mean_squared_error(y_test, preds)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, preds)
+    r2 = r2_score(y_test, preds) if len(y_test) >= 2 else float("nan")
+
+    return {
+        "name": name,
+        "model": model,
+        "preds": preds,
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+    }
+
+
+def print_model_results(results, window_name, player_name):
+    print("\n" + "=" * 110)
+    print(f"MODEL RESULTS: {player_name.upper()} | {window_name.upper()}")
+    print("=" * 110)
+
+    rows = []
+    for r in results:
+        rows.append({
+            "Model": r["name"],
+            "RMSE": round(r["rmse"], 2),
+            "MAE": round(r["mae"], 2),
+            "R2": round(r["r2"], 3) if not np.isnan(r["r2"]) else np.nan
+        })
+
+    res_df = pd.DataFrame(rows).sort_values("RMSE").reset_index(drop=True)
+    print(res_df.to_string(index=False))
+
+
+def print_actual_vs_predicted(results, y_test):
+    for result in results:
+        print(f"\n{result['name']}")
+        print(f"RMSE: {result['rmse']:.2f}")
+        print(f"MAE : {result['mae']:.2f}")
+        print(f"R2  : {result['r2']:.3f}" if not np.isnan(result["r2"]) else "R2  : N/A")
+
+        results_df = pd.DataFrame({
+            "Actual": y_test.values,
+            "Predicted": np.round(result["preds"], 2)
+        }, index=y_test.index)
+
+        print("\nActual vs Predicted:")
+        print(results_df.to_string())
+
+
+def plot_model_results(window_name, model_name, player_name, test_df, y_test, preds):
+    plt.figure(figsize=(10, 6))
+    plt.plot(test_df["game_date"], y_test.values, marker="o", label="Actual Points")
+    plt.plot(test_df["game_date"], preds, marker="o", label="Predicted Points")
+    plt.xticks(rotation=45)
+    plt.xlabel("Game Date")
+    plt.ylabel("Points")
+    plt.title(f"{player_name} | {window_name} | {model_name} | Actual vs Predicted")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def get_subsets(df):
+    latest_season = df["season"].iloc[-1]
+    return {
+        "season": df[df["season"] == latest_season].copy(),
+        "career": df.copy(),
+        "playoffs": df[df["is_playoff"] == 1].copy(),
+        "regular": df[df["is_playoff"] == 0].copy(),
+    }
+
+
+# =========================================================
+# NEXT GAME FEATURE ROW
+# =========================================================
+
+def build_next_game_row(raw_df, next_game_context, assume_playoff=False):
+    raw_df = raw_df.copy().sort_values("game_date").reset_index(drop=True)
+    last_row = raw_df.iloc[-1]
+
+    next_opponent = next_game_context["opponent"]
+    next_is_home = int(next_game_context["is_home"])
+    next_is_playoff = 1 if assume_playoff else 0
+
+    opp_hist = raw_df[raw_df["opponent"] == next_opponent].copy()
+
+    if opp_hist.empty:
+        opp_games_before = 0
+        opp_avg_points_before = raw_df["points"].mean()
+        opp_median_points_before = raw_df["points"].median()
+        opp_std_points_before = raw_df["points"].std()
+        opp_max_points_before = raw_df["points"].max()
+        opp_avg_ast_before = raw_df["ast"].mean()
+        opp_avg_reb_before = raw_df["reb"].mean()
+        opp_avg_minutes_before = raw_df["numMinutes"].mean()
+        opp_fg_pct_before = raw_df["fg_pct"].mean()
+    else:
+        opp_games_before = len(opp_hist)
+        opp_avg_points_before = opp_hist["points"].mean()
+        opp_median_points_before = opp_hist["points"].median()
+        opp_std_points_before = opp_hist["points"].std()
+        opp_max_points_before = opp_hist["points"].max()
+        opp_avg_ast_before = opp_hist["ast"].mean()
+        opp_avg_reb_before = opp_hist["reb"].mean()
+        opp_avg_minutes_before = opp_hist["numMinutes"].mean()
+        opp_fg_pct_before = opp_hist["fg_pct"].mean()
+
+    if pd.isna(opp_std_points_before):
+        opp_std_points_before = 0.0
+
+    latest_date = raw_df["game_date"].max()
+    cutoff_date = latest_date - pd.Timedelta(days=21)
+    recent_df = raw_df[raw_df["game_date"] >= cutoff_date].copy()
+
+    recent_3w_avg = recent_df["points"].mean() if not recent_df.empty else raw_df["points"].mean()
+    season_avg_to_date = raw_df["points"].mean()
+    trend_diff = recent_3w_avg - season_avg_to_date
+
+    last_playoff_avg = raw_df[raw_df["is_playoff"] == 1]["points"].tail(3).mean()
+    if pd.isna(last_playoff_avg):
+        last_playoff_avg = raw_df["points"].mean()
+
+    row = {
+        "is_home": next_is_home,
+        "is_playoff": next_is_playoff,
+        "prev_is_playoff": last_row["is_playoff"],
+
+        "prev_points": last_row["points"],
+        "prev_minutes": last_row["numMinutes"],
+        "prev_ast": last_row["ast"],
+        "prev_reb": last_row["reb"],
+        "prev_stl": last_row["stl"],
+        "prev_blk": last_row["blk"],
+        "prev_tov": last_row["tov"],
+        "prev_fg_pct": last_row["fg_pct"],
+        "prev_fg3_pct": last_row["fg3_pct"],
+        "prev_ft_pct": last_row["ft_pct"],
+        "prev_plus_minus": last_row["plus_minus"],
+
+        "avg_points_3": raw_df["points"].tail(3).mean(),
+        "avg_points_5": raw_df["points"].tail(5).mean(),
+        "avg_minutes_3": raw_df["numMinutes"].tail(3).mean(),
+        "avg_ast_3": raw_df["ast"].tail(3).mean(),
+        "avg_reb_3": raw_df["reb"].tail(3).mean(),
+        "avg_fg_pct_3": raw_df["fg_pct"].tail(3).mean(),
+
+        "prev_tm_points_total": last_row["tm_points_total"],
+        "prev_tm_ast_total": last_row["tm_ast_total"],
+        "prev_tm_reb_total": last_row["tm_reb_total"],
+        "prev_tm_minutes_total": last_row["tm_minutes_total"],
+        "prev_tm_fg_pct": last_row["tm_fg_pct"],
+
+        "avg_tm_points_3": raw_df["tm_points_total"].tail(3).mean(),
+        "avg_tm_points_5": raw_df["tm_points_total"].tail(5).mean(),
+        "avg_tm_ast_3": raw_df["tm_ast_total"].tail(3).mean(),
+        "avg_tm_reb_3": raw_df["tm_reb_total"].tail(3).mean(),
+        "avg_tm_minutes_3": raw_df["tm_minutes_total"].tail(3).mean(),
+        "avg_tm_fg_pct_3": raw_df["tm_fg_pct"].tail(3).mean(),
+
+        "team_avg_points_3": raw_df["tm_points_total"].tail(3).mean(),
+        "team_avg_points_5": raw_df["tm_points_total"].tail(5).mean(),
+
+        "prev_top_tm_points": last_row["top_tm_points"],
+        "prev_second_tm_points": last_row["second_tm_points"],
+        "prev_third_tm_points": last_row["third_tm_points"],
+        "prev_top3_tm_points_total": last_row["top3_tm_points_total"],
+        "prev_player_team_points_share": last_row["player_team_points_share"],
+
+        "avg_top_tm_points_3": raw_df["top_tm_points"].tail(3).mean(),
+        "avg_second_tm_points_3": raw_df["second_tm_points"].tail(3).mean(),
+        "avg_third_tm_points_3": raw_df["third_tm_points"].tail(3).mean(),
+        "avg_top3_tm_points_total_3": raw_df["top3_tm_points_total"].tail(3).mean(),
+        "avg_player_team_points_share_3": raw_df["player_team_points_share"].tail(3).mean(),
+        "player_usage_trend_3": raw_df["player_team_points_share"].tail(3).mean(),
+
+        "opp_games_before": opp_games_before,
+        "opp_avg_points_before": opp_avg_points_before,
+        "opp_median_points_before": opp_median_points_before,
+        "opp_std_points_before": opp_std_points_before,
+        "opp_max_points_before": opp_max_points_before,
+        "opp_avg_ast_before": opp_avg_ast_before,
+        "opp_avg_reb_before": opp_avg_reb_before,
+        "opp_avg_minutes_before": opp_avg_minutes_before,
+        "opp_fg_pct_before": opp_fg_pct_before,
+
+        "recent_3w_avg": recent_3w_avg,
+        "season_avg_to_date": season_avg_to_date,
+        "trend_diff": trend_diff,
+
+        "playoff_points_boost": last_row["points"] * next_is_playoff,
+        "playoff_minutes_boost": last_row["numMinutes"] * next_is_playoff,
+        "playoff_usage_boost": last_row["player_team_points_share"] * next_is_playoff,
+        "avg_playoff_points_3": last_playoff_avg,
+    }
+
+    return pd.DataFrame([row])
+
+
+# =========================================================
+# WINDOW RUNNER
+# =========================================================
+
+def run_window(player_name, window_name, raw_window_df, next_game_context, assume_playoff=False):
+    if raw_window_df.empty:
+        print(f"\nNo data for {player_name} window: {window_name}")
+        return None
+
+    feature_df = add_opponent_history_features(raw_window_df)
+    feature_df = add_recent_form_features(feature_df)
+    feature_df = add_trend_features(feature_df, days=21)
+    feature_df = finalize_feature_table(feature_df)
+
+    if feature_df.empty or len(feature_df) < 10:
+        print(f"\nNot enough rows after feature engineering for {player_name} window: {window_name}")
+        return None
+
+    feature_cols = get_feature_columns()
+    split_result = split_train_test(feature_df, feature_cols)
+    if split_result is None:
+        print(f"\nNot enough rows for train/test split in {player_name} window: {window_name}")
+        return None
+
+    X_train, X_test, y_train, y_test, train_df, test_df = split_result
+
+    print("\n" + "=" * 110)
+    print(f"PLAYER: {player_name.upper()} | WINDOW: {window_name.upper()}")
+    print("=" * 110)
+    print(f"Rows after features: {len(feature_df)}")
+    print(f"Train rows (80%): {len(train_df)}")
+    print(f"Test rows  (20%): {len(test_df)}")
+
+    models = get_models()
+    results = []
+
+    for model_name, model in models.items():
+        result = evaluate_model(model_name, model, X_train, X_test, y_train, y_test)
+        results.append(result)
+
+        plot_model_results(window_name, model_name, player_name, test_df, y_test, result["preds"])
+
+    print_model_results(results, window_name, player_name)
+    print_actual_vs_predicted(results, y_test)
+
+    best_result = min(results, key=lambda x: x["rmse"])
+    best_model = best_result["model"]
+
+    print(f"\nBest model for {player_name} {window_name}: {best_result['name']}")
+
+    next_pred = None
+    if next_game_context is not None:
+        next_game_X = build_next_game_row(
+            raw_window_df,
+            next_game_context,
+            assume_playoff=assume_playoff
+        )[feature_cols]
+        next_pred = float(best_model.predict(next_game_X)[0])
+        print(f"Predicted {player_name} points next game: {next_pred:.2f}")
+    else:
+        print(f"No next game context available for {player_name}. Prediction skipped.")
+
+    return {
+        "window": window_name,
+        "best_model_name": best_result["name"],
+        "rmse": best_result["rmse"],
+        "mae": best_result["mae"],
+        "r2": best_result["r2"],
+        "prediction": next_pred,
+    }
+
+
+# =========================================================
+# BLENDED FINAL PREDICTION
+# =========================================================
+
+def build_blended_prediction(season_result, career_result, opponent_summary, trend_info, opponent, playoff_gap=None):
+    season_pred = season_result["prediction"] if season_result else None
+    career_pred = career_result["prediction"] if career_result else None
+
+    opp_row = opponent_summary[opponent_summary["opponent"] == opponent]
+    if not opp_row.empty:
+        opp_avg = float(opp_row.iloc[0]["avg_points"])
+        opp_std = float(opp_row.iloc[0]["std_points"])
+    else:
+        opp_avg = np.nan
+        opp_std = np.nan
+
+    pieces = []
+
+    if season_pred is not None:
+        pieces.append(("season", season_pred, 0.45))
+    if career_pred is not None:
+        pieces.append(("career", career_pred, 0.30))
+    if pd.notna(opp_avg):
+        pieces.append(("opponent_avg", opp_avg, 0.25))
+
+    numerator = sum(value * weight for _, value, weight in pieces)
+    denominator = sum(weight for _, _, weight in pieces)
+    base_blend = numerator / denominator if denominator > 0 else np.nan
+
+    trend_diff = trend_info["trend_diff"]
+    if pd.isna(trend_diff):
+        trend_adjustment = 0.0
+    else:
+        trend_adjustment = max(-3.0, min(3.0, trend_diff * 0.20))
+
+    playoff_adjustment = 0.0
+    if playoff_gap is not None and pd.notna(playoff_gap.get("playoff_minus_regular")):
+        playoff_adjustment = max(-4.0, min(4.0, playoff_gap["playoff_minus_regular"] * 0.35))
+
+    final_prediction = base_blend + trend_adjustment + playoff_adjustment
+
+    if pd.isna(opp_std) or opp_std <= 0:
+        low = max(0.0, final_prediction - 5)
+        high = final_prediction + 5
+    else:
+        spread = max(5.0, min(opp_std * 0.60, 9.0))
+        low = max(0.0, final_prediction - spread)
+        high = final_prediction + spread
+
+    return {
+        "season_pred": season_pred,
+        "career_pred": career_pred,
+        "opp_avg": opp_avg,
+        "opp_std": opp_std,
+        "trend_diff": trend_diff,
+        "trend_status": trend_info["status"],
+        "trend_adjustment": trend_adjustment,
+        "playoff_adjustment": playoff_adjustment,
+        "final_prediction": final_prediction,
+        "range_low": low,
+        "range_high": high,
+    }
+
+
+# =========================================================
+# FINAL OUTPUT
+# =========================================================
+
+def print_prediction_summary(player_name, next_game_context, blended, assume_playoff=False):
+    print("\n" + "=" * 110)
+    print(f"FINAL BLENDED PREDICTION FOR {player_name.upper()}")
+    print("=" * 110)
+
+    print(f"Opponent                 : {next_game_context['opponent']}")
+    print(f"Location                 : {'Home' if next_game_context['is_home'] == 1 else 'Away'}")
+    print(f"Assumed game type        : {'Playoff' if assume_playoff else 'Regular Season'}")
+    print(f"Season model prediction  : {blended['season_pred']:.2f}" if blended["season_pred"] is not None else "Season model prediction  : N/A")
+    print(f"Career model prediction  : {blended['career_pred']:.2f}" if blended["career_pred"] is not None else "Career model prediction  : N/A")
+    print(f"Opponent historical avg  : {blended['opp_avg']:.2f}" if pd.notna(blended["opp_avg"]) else "Opponent historical avg  : N/A")
+    print(f"Trend status             : {blended['trend_status']}")
+    print(f"Trend difference         : {blended['trend_diff']:.2f}")
+    print(f"Trend adjustment         : {blended['trend_adjustment']:.2f}")
+    print(f"Playoff adjustment       : {blended['playoff_adjustment']:.2f}")
+    print(f"Final predicted points   : {blended['final_prediction']:.2f}")
+    print(f"Prediction range         : {blended['range_low']:.2f} to {blended['range_high']:.2f}")
+
+
+def print_prescriptive_steps(player_name):
+    print("\n" + "=" * 110)
+    print(f"PRESCRIPTIVE STEPS TO BUILD A MODEL FOR {player_name.upper()}")
+    print("=" * 110)
+    print("1. Define the target variable as player points.")
+    print("2. Load historical game data from the database.")
+    print("3. Add opponent and home/away context from the matchup string.")
+    print("4. Add a playoff indicator so the model knows playoff games differ from regular season games.")
+    print("5. Build recent-form features such as last game, rolling 3-game averages, and rolling 5-game averages.")
+    print("6. Build opponent-history features such as average points against each opponent before the current game.")
+    print("7. Build 3-week trend features to measure whether scoring is rising or falling.")
+    print("8. Add teammate/team context features from the database.")
+    print("9. Add playoff-aware interaction features like playoff_points_boost and playoff_usage_boost.")
+    print("10. Split the data into train and test sets using chronological order.")
+    print("11. Train multiple models and compare RMSE, MAE, and R2.")
+    print("12. Use the best model to predict the next game and adjust the final prediction with trend and playoff effects.")
+
+
+# =========================================================
+# PLAYER RUNNER
+# =========================================================
+
+def run_for_player(player_name: str, assume_playoff=True):
+    raw_df = load_player(player_name)
+
+    if raw_df.empty:
+        print(f"No data found for {player_name}. Run viewer.py first.")
+        return
+
+    raw_df = add_basic_context(raw_df)
+    raw_df = add_playoff_flag(raw_df)
+
+    print_last_games(raw_df, player_name, n=10)
+
+    opponent_summary = build_opponent_summary(raw_df)
+    print_opponent_report(opponent_summary, player_name)
+
+    regular_vs_playoff_summary = build_regular_vs_playoff_summary(raw_df)
+    print_regular_vs_playoff_report(regular_vs_playoff_summary, player_name)
+
+    trend_info = compute_trend_info(raw_df, days=21)
+    print_trend_info(trend_info, player_name)
+
+    playoff_gap = compute_regular_vs_playoff_gap(raw_df)
+    print_regular_vs_playoff_gap(playoff_gap, player_name)
+
+    print_prescriptive_steps(player_name)
+
+    next_game_context = get_next_game_context(player_name)
+    subsets = get_subsets(raw_df)
+
+    if next_game_context is not None:
+        print(f"\nNext game detected automatically for {player_name}:")
+        print(next_game_context)
+
+        season_result = run_window(
+            player_name, "season", subsets["season"], next_game_context, assume_playoff=assume_playoff
+        )
+        career_result = run_window(
+            player_name, "career", subsets["career"], next_game_context, assume_playoff=assume_playoff
+        )
+
+        # optional extra playoff-only modeling section
+        if not subsets["playoffs"].empty and len(subsets["playoffs"]) >= 10:
+            run_window(
+                player_name, "playoffs", subsets["playoffs"], next_game_context, assume_playoff=True
+            )
+
+        blended = build_blended_prediction(
+            season_result=season_result,
+            career_result=career_result,
+            opponent_summary=opponent_summary,
+            trend_info=trend_info,
+            opponent=next_game_context["opponent"],
+            playoff_gap=playoff_gap if assume_playoff else None,
+        )
+
+        print_prediction_summary(player_name, next_game_context, blended, assume_playoff=assume_playoff)
+    else:
+        print(f"\nSkipping next-game prediction for {player_name} because no next game was found.")
+
+        run_window(player_name, "season", subsets["season"], None, assume_playoff=assume_playoff)
+        run_window(player_name, "career", subsets["career"], None, assume_playoff=assume_playoff)
+
+        if not subsets["playoffs"].empty and len(subsets["playoffs"]) >= 10:
+            run_window(player_name, "playoffs", subsets["playoffs"], None, assume_playoff=True)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    for player_name in PLAYER_NAMES:
+        print("\n" + "#" * 120)
+        print(f"RUNNING MODEL FOR {player_name.upper()}")
+        print("#" * 120)
+        run_for_player(player_name, assume_playoff=True)
+
+
+if __name__ == "__main__":
+    main()
