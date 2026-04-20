@@ -1,0 +1,817 @@
+import sqlite3
+import sys
+import time
+from datetime import datetime
+
+import pandas as pd
+from nba_api.stats.static import players, teams
+from nba_api.stats.endpoints import (
+    playergamelog,
+    leaguedashteamstats,
+    scheduleleaguev2,
+)
+
+
+DB_PATH = "nba_database.db"
+TABLE = "player_game_logs"
+TEAM_NAME = "Los Angeles Lakers"
+TEAM_SEASON = "2025-26"
+
+PLAYER_NAMES = [
+    "Adou Thiero",
+    "Jarred Vanderbilt",
+    "Dalton Knecht",
+    "Deandre Ayton",
+    "Bronny James",
+    "Luke Kennard",
+    "Jaxson Hayes",
+    "Jake LaRavia",
+    "Maxi Kleber",
+    "Austin Reaves",
+    "Drew Timme",
+    "Nick Smith Jr.",
+    "LeBron James",
+    "Rui Hachimura",
+    "Chris Manon",
+    "Marcus Smart",
+    "Luka Doncic",
+]
+
+SEASONS = [
+    "2018-19",
+    "2019-20",
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24",
+    "2024-25",
+    "2025-26",
+]
+
+PLAYER_NAME_FALLBACKS = {
+    "Luka Doncic": ["Luka Dončić"],
+    "Chris Manon": ["Chris Mañon"],
+}
+
+
+class Tee:
+    def __init__(self, filename):
+        self.stdout = sys.stdout
+        self.file = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.stdout.write(message)
+        self.file.write(message)
+
+    def flush(self):
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self):
+        try:
+            self.file.close()
+        except Exception:
+            pass
+
+
+def recreate_table():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
+
+    cur.execute(f"""
+        CREATE TABLE {TABLE} (
+            game_id TEXT,
+            player_id INTEGER,
+            firstName TEXT,
+            lastName TEXT,
+            full_name TEXT,
+            season TEXT,
+            game_date TEXT,
+            matchup TEXT,
+            wl TEXT,
+            numMinutes REAL,
+            points REAL,
+            ast REAL,
+            reb REAL,
+            stl REAL,
+            blk REAL,
+            tov REAL,
+            fg_pct REAL,
+            fg3_pct REAL,
+            ft_pct REAL,
+            plus_minus REAL,
+
+            tm_points_total REAL,
+            tm_ast_total REAL,
+            tm_reb_total REAL,
+            tm_minutes_total REAL,
+            tm_fg_pct REAL,
+
+            top_tm_points REAL,
+            second_tm_points REAL,
+            third_tm_points REAL,
+            top3_tm_points_total REAL,
+            player_team_points_share REAL,
+
+            updated_at TEXT,
+
+            PRIMARY KEY (game_id, player_id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def split_name(full_name: str):
+    parts = full_name.strip().split()
+    first = parts[0] if parts else ""
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return first, last
+
+
+def get_player_id(full_name: str) -> int:
+    search_names = [full_name] + PLAYER_NAME_FALLBACKS.get(full_name, [])
+
+    for name in search_names:
+        matches = players.find_players_by_full_name(name)
+        if matches:
+            return int(matches[0]["id"])
+
+    raise ValueError(f"Player '{full_name}' not found in nba_api.")
+
+
+def fetch_player_logs_for_season(player_name: str, season: str) -> pd.DataFrame:
+    try:
+        player_id = get_player_id(player_name)
+    except ValueError as e:
+        print(f"Skipping {player_name} for {season}: {e}")
+        return pd.DataFrame()
+
+    first_name, last_name = split_name(player_name)
+
+    time.sleep(0.6)
+
+    try:
+        gamelog = playergamelog.PlayerGameLog(
+            player_id=player_id,
+            season=season,
+            season_type_all_star="Regular Season"
+        )
+        df = gamelog.get_data_frames()[0]
+    except Exception as e:
+        print(f"Skipping {player_name} for {season}: could not fetch logs ({e})")
+        return pd.DataFrame()
+
+    if df.empty:
+        print(f"No regular season data for {player_name} in {season}.")
+        return pd.DataFrame()
+
+    df = df.rename(columns={
+        "Game_ID": "game_id",
+        "GAME_DATE": "game_date",
+        "MATCHUP": "matchup",
+        "WL": "wl",
+        "MIN": "numMinutes",
+        "PTS": "points",
+        "AST": "ast",
+        "REB": "reb",
+        "STL": "stl",
+        "BLK": "blk",
+        "TOV": "tov",
+        "FG_PCT": "fg_pct",
+        "FG3_PCT": "fg3_pct",
+        "FT_PCT": "ft_pct",
+        "PLUS_MINUS": "plus_minus"
+    })
+
+    numeric_cols = [
+        "numMinutes", "points", "ast", "reb", "stl",
+        "blk", "tov", "fg_pct", "fg3_pct", "ft_pct", "plus_minus"
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["player_id"] = player_id
+    df["firstName"] = first_name
+    df["lastName"] = last_name
+    df["full_name"] = player_name
+    df["season"] = season
+    df["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    keep_cols = [
+        "game_id", "player_id", "firstName", "lastName", "full_name", "season",
+        "game_date", "matchup", "wl", "numMinutes", "points", "ast",
+        "reb", "stl", "blk", "tov", "fg_pct", "fg3_pct", "ft_pct",
+        "plus_minus", "updated_at"
+    ]
+
+    return df[keep_cols].copy()
+
+
+def fetch_all_players_logs() -> pd.DataFrame:
+    all_dfs = []
+
+    for player_name in PLAYER_NAMES:
+        print(f"\n{'=' * 100}")
+        print(f"FETCHING LOGS FOR {player_name.upper()}")
+        print(f"{'=' * 100}")
+
+        for season in SEASONS:
+            print(f"Fetching {player_name} logs for {season}...")
+            season_df = fetch_player_logs_for_season(player_name, season)
+
+            if not season_df.empty:
+                all_dfs.append(season_df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined["game_date"] = pd.to_datetime(combined["game_date"], errors="coerce")
+    combined = combined.dropna(subset=["game_id", "player_id", "game_date"])
+    combined = combined.sort_values(["game_date", "full_name"]).reset_index(drop=True)
+
+    return combined
+
+
+def insert_logs(df: pd.DataFrame):
+    if df.empty:
+        print("No data fetched.")
+        return
+
+    df = df.copy()
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["updated_at"] = df["updated_at"].astype(str)
+
+    rows = [
+        tuple(None if pd.isna(x) else x for x in row)
+        for row in df.itertuples(index=False, name=None)
+    ]
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    sql = f"""
+        INSERT OR REPLACE INTO {TABLE} (
+            game_id, player_id, firstName, lastName, full_name, season,
+            game_date, matchup, wl, numMinutes, points, ast,
+            reb, stl, blk, tov, fg_pct, fg3_pct, ft_pct,
+            plus_minus, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    cur.executemany(sql, rows)
+    conn.commit()
+    conn.close()
+
+    print(f"Inserted {len(df)} player game logs into {TABLE}.")
+
+
+def update_teammate_context_from_db():
+    conn = sqlite3.connect(DB_PATH)
+
+    df = pd.read_sql_query(f"""
+        SELECT
+            game_id,
+            player_id,
+            full_name,
+            points,
+            ast,
+            reb,
+            numMinutes,
+            fg_pct
+        FROM {TABLE}
+        ORDER BY game_id, full_name
+    """, conn)
+
+    if df.empty:
+        conn.close()
+        print("No rows found for teammate context update.")
+        return
+
+    numeric_cols = ["points", "ast", "reb", "numMinutes", "fg_pct"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    updates = []
+
+    for game_id, game_df in df.groupby("game_id"):
+        relevant_df = game_df[game_df["full_name"].isin(PLAYER_NAMES)].copy()
+
+        if relevant_df.empty:
+            continue
+
+        for _, row in relevant_df.iterrows():
+            current_player_id = row["player_id"]
+            teammates = relevant_df[relevant_df["player_id"] != current_player_id].copy()
+
+            player_points = float(row["points"]) if pd.notna(row["points"]) else 0.0
+            team_points_total_all = float(relevant_df["points"].fillna(0).sum())
+            player_team_points_share = (
+                player_points / team_points_total_all if team_points_total_all > 0 else None
+            )
+
+            if teammates.empty:
+                tm_points_total = 0.0
+                tm_ast_total = 0.0
+                tm_reb_total = 0.0
+                tm_minutes_total = 0.0
+                tm_fg_pct = 0.0
+                top_tm_points = 0.0
+                second_tm_points = 0.0
+                third_tm_points = 0.0
+                top3_tm_points_total = 0.0
+            else:
+                teammate_points_sorted = teammates["points"].fillna(0).sort_values(ascending=False).tolist()
+
+                top_tm_points = float(teammate_points_sorted[0]) if len(teammate_points_sorted) > 0 else 0.0
+                second_tm_points = float(teammate_points_sorted[1]) if len(teammate_points_sorted) > 1 else 0.0
+                third_tm_points = float(teammate_points_sorted[2]) if len(teammate_points_sorted) > 2 else 0.0
+                top3_tm_points_total = top_tm_points + second_tm_points + third_tm_points
+
+                tm_points_total = float(teammates["points"].sum(skipna=True))
+                tm_ast_total = float(teammates["ast"].sum(skipna=True))
+                tm_reb_total = float(teammates["reb"].sum(skipna=True))
+                tm_minutes_total = float(teammates["numMinutes"].sum(skipna=True))
+                tm_fg_pct = (
+                    float(teammates["fg_pct"].mean(skipna=True))
+                    if teammates["fg_pct"].notna().any() else None
+                )
+
+            updates.append((
+                tm_points_total,
+                tm_ast_total,
+                tm_reb_total,
+                tm_minutes_total,
+                tm_fg_pct,
+                top_tm_points,
+                second_tm_points,
+                third_tm_points,
+                top3_tm_points_total,
+                player_team_points_share,
+                game_id,
+                current_player_id
+            ))
+
+    cur = conn.cursor()
+    cur.executemany(f"""
+        UPDATE {TABLE}
+        SET
+            tm_points_total = ?,
+            tm_ast_total = ?,
+            tm_reb_total = ?,
+            tm_minutes_total = ?,
+            tm_fg_pct = ?,
+            top_tm_points = ?,
+            second_tm_points = ?,
+            third_tm_points = ?,
+            top3_tm_points_total = ?,
+            player_team_points_share = ?
+        WHERE game_id = ? AND player_id = ?
+    """, updates)
+
+    conn.commit()
+    conn.close()
+
+    print(f"Updated teammate context from database for {len(updates)} rows.")
+
+
+def show_last_games_from_db(player_name: str, limit: int = 10):
+    conn = sqlite3.connect(DB_PATH)
+
+    query = f"""
+    SELECT
+        game_date,
+        matchup,
+        points,
+        ast,
+        reb,
+        tm_points_total,
+        tm_ast_total,
+        tm_reb_total,
+        top3_tm_points_total,
+        player_team_points_share
+    FROM {TABLE}
+    WHERE full_name = ?
+    ORDER BY game_date DESC
+    LIMIT ?
+    """
+
+    df = pd.read_sql_query(query, conn, params=(player_name, limit))
+    conn.close()
+
+    if df.empty:
+        print(f"No games found in database for {player_name}.")
+        return
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+
+    print(f"\n{player_name}'s last {limit} games in DB:")
+    for _, row in df.iterrows():
+        print(
+            f"{row['game_date'].date()} | {row['matchup']} | "
+            f"{row['points']} pts | {row['ast']} ast | {row['reb']} reb | "
+            f"tm_pts={row['tm_points_total']} | "
+            f"tm_ast={row['tm_ast_total']} | "
+            f"tm_reb={row['tm_reb_total']} | "
+            f"top3_tm_pts={row['top3_tm_points_total']} | "
+            f"share={row['player_team_points_share']}"
+        )
+
+
+def get_team_info(team_name: str):
+    nba_teams = teams.get_teams()
+    for team in nba_teams:
+        if team["full_name"].lower() == team_name.lower():
+            return team
+    raise ValueError(f"Team '{team_name}' not found.")
+
+
+def get_team_id(team_name: str) -> int:
+    return int(get_team_info(team_name)["id"])
+
+
+def fetch_team_stats(team_name=TEAM_NAME, season=TEAM_SEASON):
+    team_id = get_team_id(team_name)
+
+    try:
+        base_df = leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            season_type_all_star="Regular Season",
+            per_mode_detailed="PerGame",
+            measure_type_detailed_defense="Base"
+        ).get_data_frames()[0]
+
+        adv_df = leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            season_type_all_star="Regular Season",
+            per_mode_detailed="PerGame",
+            measure_type_detailed_defense="Advanced"
+        ).get_data_frames()[0]
+    except Exception as e:
+        print(f"Could not fetch team stats for {team_name} ({season}): {e}")
+        return None
+
+    if base_df.empty or adv_df.empty:
+        print(f"No team stats returned for {team_name} ({season}).")
+        return None
+
+    base_row = base_df[base_df["TEAM_ID"] == team_id]
+    adv_row = adv_df[adv_df["TEAM_ID"] == team_id]
+
+    if base_row.empty or adv_row.empty:
+        print(f"Could not locate {team_name} in returned team stats.")
+        return None
+
+    base_row = base_row.iloc[0]
+    adv_row = adv_row.iloc[0]
+
+    return {
+        "team_name": team_name,
+        "season": season,
+        "gp": base_row.get("GP"),
+        "wins": base_row.get("W"),
+        "losses": base_row.get("L"),
+        "win_pct": base_row.get("W_PCT"),
+        "points_per_game": base_row.get("PTS"),
+        "rebounds_per_game": base_row.get("REB"),
+        "assists_per_game": base_row.get("AST"),
+        "steals_per_game": base_row.get("STL"),
+        "blocks_per_game": base_row.get("BLK"),
+        "turnovers_per_game": base_row.get("TOV"),
+        "fg_pct": base_row.get("FG_PCT"),
+        "fg3_pct": base_row.get("FG3_PCT"),
+        "ft_pct": base_row.get("FT_PCT"),
+        "off_rating": adv_row.get("OFF_RATING"),
+        "def_rating": adv_row.get("DEF_RATING"),
+        "net_rating": adv_row.get("NET_RATING"),
+        "pace": adv_row.get("PACE"),
+        "ast_to_tov": adv_row.get("AST_TO"),
+        "rebound_pct": adv_row.get("REB_PCT"),
+        "ts_pct": adv_row.get("TS_PCT"),
+        "efg_pct": adv_row.get("EFG_PCT"),
+    }
+
+
+def print_team_stats(team_stats):
+    if not team_stats:
+        return
+
+    def pct(v):
+        if v is None or pd.isna(v):
+            return "N/A"
+        return f"{float(v):.3f}"
+
+    def num(v):
+        if v is None or pd.isna(v):
+            return "N/A"
+        return f"{float(v):.2f}"
+
+    print("\n" + "=" * 100)
+    print(f"{team_stats['team_name'].upper()} TEAM STATS ({team_stats['season']})")
+    print("=" * 100)
+    print(f"Games Played       : {team_stats['gp']}")
+    print(f"Record             : {team_stats['wins']}-{team_stats['losses']}")
+    print(f"Win %              : {pct(team_stats['win_pct'])}")
+    print("-" * 100)
+    print(f"Points / Game      : {num(team_stats['points_per_game'])}")
+    print(f"Rebounds / Game    : {num(team_stats['rebounds_per_game'])}")
+    print(f"Assists / Game     : {num(team_stats['assists_per_game'])}")
+    print(f"Steals / Game      : {num(team_stats['steals_per_game'])}")
+    print(f"Blocks / Game      : {num(team_stats['blocks_per_game'])}")
+    print(f"Turnovers / Game   : {num(team_stats['turnovers_per_game'])}")
+    print("-" * 100)
+    print(f"FG%                : {pct(team_stats['fg_pct'])}")
+    print(f"3PT%               : {pct(team_stats['fg3_pct'])}")
+    print(f"FT%                : {pct(team_stats['ft_pct'])}")
+    print(f"TS%                : {pct(team_stats['ts_pct'])}")
+    print(f"EFG%               : {pct(team_stats['efg_pct'])}")
+    print("-" * 100)
+    print(f"Offensive Rating   : {num(team_stats['off_rating'])}")
+    print(f"Defensive Rating   : {num(team_stats['def_rating'])}")
+    print(f"Net Rating         : {num(team_stats['net_rating'])}")
+    print(f"Pace               : {num(team_stats['pace'])}")
+    print(f"AST/TO Ratio       : {num(team_stats['ast_to_tov'])}")
+    print(f"Rebound %          : {pct(team_stats['rebound_pct'])}")
+
+
+def show_full_team_impact(team_stats, df):
+    if df.empty or not team_stats:
+        print("No data available for player impact analysis.")
+        return
+
+    print("\n" + "=" * 100)
+    print("FULL TEAM IMPACT BREAKDOWN")
+    print("=" * 100)
+
+    team_pts = float(team_stats["points_per_game"] or 0)
+    team_ast = float(team_stats["assists_per_game"] or 0)
+    team_reb = float(team_stats["rebounds_per_game"] or 0)
+    team_stl = float(team_stats["steals_per_game"] or 0)
+    team_blk = float(team_stats["blocks_per_game"] or 0)
+    team_tov = float(team_stats["turnovers_per_game"] or 0)
+
+    grouped = df.groupby("full_name")
+    results = []
+
+    for player, group in grouped:
+        avg_pts = float(group["points"].mean()) if group["points"].notna().any() else 0.0
+        avg_ast = float(group["ast"].mean()) if group["ast"].notna().any() else 0.0
+        avg_reb = float(group["reb"].mean()) if group["reb"].notna().any() else 0.0
+        avg_stl = float(group["stl"].mean()) if group["stl"].notna().any() else 0.0
+        avg_blk = float(group["blk"].mean()) if group["blk"].notna().any() else 0.0
+        avg_tov = float(group["tov"].mean()) if group["tov"].notna().any() else 0.0
+
+        pts_pct = (avg_pts / team_pts * 100) if team_pts > 0 else 0.0
+        ast_pct = (avg_ast / team_ast * 100) if team_ast > 0 else 0.0
+        reb_pct = (avg_reb / team_reb * 100) if team_reb > 0 else 0.0
+        stl_pct = (avg_stl / team_stl * 100) if team_stl > 0 else 0.0
+        blk_pct = (avg_blk / team_blk * 100) if team_blk > 0 else 0.0
+        tov_pct = (avg_tov / team_tov * 100) if team_tov > 0 else 0.0
+
+        results.append({
+            "player": player,
+            "games": len(group),
+            "ppg": avg_pts,
+            "apg": avg_ast,
+            "rpg": avg_reb,
+            "spg": avg_stl,
+            "bpg": avg_blk,
+            "tpg": avg_tov,
+            "pts_pct": pts_pct,
+            "ast_pct": ast_pct,
+            "reb_pct": reb_pct,
+            "stl_pct": stl_pct,
+            "blk_pct": blk_pct,
+            "tov_pct": tov_pct,
+            "team_wo_pts": team_pts - avg_pts,
+            "team_wo_ast": team_ast - avg_ast,
+            "team_wo_reb": team_reb - avg_reb,
+            "team_wo_stl": team_stl - avg_stl,
+            "team_wo_blk": team_blk - avg_blk,
+            "team_wo_tov": team_tov - avg_tov,
+        })
+
+    results = sorted(results, key=lambda x: x["ppg"], reverse=True)
+
+    for r in results:
+        print("\n" + "-" * 100)
+        print(f"{r['player'].upper()}  |  Games in DB: {r['games']}")
+        print("-" * 100)
+        print(f"PPG: {r['ppg']:.2f} | Team Share: {r['pts_pct']:.2f}% | Team Without Player: {r['team_wo_pts']:.2f}")
+        print(f"APG: {r['apg']:.2f} | Team Share: {r['ast_pct']:.2f}% | Team Without Player: {r['team_wo_ast']:.2f}")
+        print(f"RPG: {r['rpg']:.2f} | Team Share: {r['reb_pct']:.2f}% | Team Without Player: {r['team_wo_reb']:.2f}")
+        print(f"SPG: {r['spg']:.2f} | Team Share: {r['stl_pct']:.2f}% | Team Without Player: {r['team_wo_stl']:.2f}")
+        print(f"BPG: {r['bpg']:.2f} | Team Share: {r['blk_pct']:.2f}% | Team Without Player: {r['team_wo_blk']:.2f}")
+        print(f"TPG: {r['tpg']:.2f} | Team Share: {r['tov_pct']:.2f}% | Team Without Player: {r['team_wo_tov']:.2f}")
+
+
+def get_next_opponent_abbr(team_name: str = TEAM_NAME, season: str = TEAM_SEASON):
+    team_info = get_team_info(team_name)
+    team_id = int(team_info["id"])
+
+    try:
+        sched_df = scheduleleaguev2.ScheduleLeagueV2(
+            league_id="00",
+            season=season
+        ).get_data_frames()[0]
+    except Exception as e:
+        print(f"Could not fetch upcoming schedule for {team_name}: {e}")
+        return None
+
+    if sched_df.empty:
+        print(f"No schedule data returned for {team_name}.")
+        return None
+
+    required_cols = [
+        "gameDate",
+        "homeTeam_teamId",
+        "awayTeam_teamId",
+        "homeTeam_teamTricode",
+        "awayTeam_teamTricode",
+    ]
+    missing = [c for c in required_cols if c not in sched_df.columns]
+    if missing:
+        print("Schedule data is missing required columns:", missing)
+        print("Available columns:", list(sched_df.columns))
+        return None
+
+    sched_df = sched_df.copy()
+    sched_df["gameDate"] = pd.to_datetime(sched_df["gameDate"], errors="coerce")
+    sched_df = sched_df.dropna(subset=["gameDate"])
+
+    today = pd.Timestamp.now().normalize()
+
+    team_games = sched_df[
+        (sched_df["homeTeam_teamId"] == team_id) |
+        (sched_df["awayTeam_teamId"] == team_id)
+    ].copy()
+
+    upcoming_games = team_games[
+        team_games["gameDate"] >= today
+    ].sort_values("gameDate")
+
+    if upcoming_games.empty:
+        print(f"No upcoming games found for {team_name}.")
+        return None
+
+    next_game = upcoming_games.iloc[0]
+
+    if int(next_game["homeTeam_teamId"]) == team_id:
+        opponent = next_game["awayTeam_teamTricode"]
+    else:
+        opponent = next_game["homeTeam_teamTricode"]
+
+    opponent = str(opponent).upper()
+    print(f"\nNext opponent detected automatically: {opponent}")
+    return opponent
+
+
+def show_head_to_head_this_season(df: pd.DataFrame, season: str = TEAM_SEASON):
+    if df.empty:
+        print("No data available for head-to-head breakdown.")
+        return
+
+    opponent_abbr = get_next_opponent_abbr(TEAM_NAME, season)
+
+    if not opponent_abbr:
+        print("Could not determine the next opponent automatically.")
+        return
+
+    working_df = df.copy()
+    working_df["game_date"] = pd.to_datetime(working_df["game_date"], errors="coerce")
+
+    working_df = working_df[
+        (working_df["season"] == season) &
+        (working_df["matchup"].astype(str).str.contains(opponent_abbr, case=False, na=False))
+    ].copy()
+
+    if working_df.empty:
+        print(f"No {season} games found against {opponent_abbr}.")
+        return
+
+    working_df = working_df.sort_values(
+        ["game_date", "game_id", "full_name"],
+        ascending=[False, False, True]
+    )
+
+    unique_games = (
+        working_df[["game_id", "game_date", "matchup", "wl", "season"]]
+        .drop_duplicates()
+        .sort_values(["game_date", "game_id"], ascending=[False, False])
+    )
+
+    print("\n" + "=" * 100)
+    print(f"HEAD-TO-HEAD THIS SEASON: LAKERS VS {opponent_abbr} ({season})")
+    print("=" * 100)
+
+    for _, game in unique_games.iterrows():
+        game_id = game["game_id"]
+        game_date = game["game_date"]
+        matchup = game["matchup"]
+        wl = game["wl"]
+
+        game_players = working_df[working_df["game_id"] == game_id].copy()
+        game_players = game_players.sort_values(
+            ["points", "ast", "reb"],
+            ascending=[False, False, False]
+        )
+
+        team_points = float(game_players["points"].fillna(0).sum())
+        team_ast = float(game_players["ast"].fillna(0).sum())
+        team_reb = float(game_players["reb"].fillna(0).sum())
+        team_stl = float(game_players["stl"].fillna(0).sum())
+        team_blk = float(game_players["blk"].fillna(0).sum())
+        team_tov = float(game_players["tov"].fillna(0).sum())
+
+        team_fg_pct = (
+            float(game_players["fg_pct"].mean(skipna=True))
+            if game_players["fg_pct"].notna().any() else 0.0
+        )
+        team_fg3_pct = (
+            float(game_players["fg3_pct"].mean(skipna=True))
+            if game_players["fg3_pct"].notna().any() else 0.0
+        )
+        team_ft_pct = (
+            float(game_players["ft_pct"].mean(skipna=True))
+            if game_players["ft_pct"].notna().any() else 0.0
+        )
+
+        print("\n" + "-" * 100)
+        print(f"DATE: {game_date.date()} | MATCHUP: {matchup} | RESULT: {wl} | SEASON: {season}")
+        print("-" * 100)
+        print(
+            f"TEAM STATS -> "
+            f"PTS: {team_points:.1f} | AST: {team_ast:.1f} | REB: {team_reb:.1f} | "
+            f"STL: {team_stl:.1f} | BLK: {team_blk:.1f} | TOV: {team_tov:.1f} | "
+            f"FG%: {team_fg_pct:.3f} | 3PT%: {team_fg3_pct:.3f} | FT%: {team_ft_pct:.3f}"
+        )
+        print("PLAYERS WHO PLAYED:")
+
+        for _, row in game_players.iterrows():
+            minutes = float(row["numMinutes"]) if pd.notna(row["numMinutes"]) else 0.0
+            points = float(row["points"]) if pd.notna(row["points"]) else 0.0
+            ast = float(row["ast"]) if pd.notna(row["ast"]) else 0.0
+            reb = float(row["reb"]) if pd.notna(row["reb"]) else 0.0
+            stl = float(row["stl"]) if pd.notna(row["stl"]) else 0.0
+            blk = float(row["blk"]) if pd.notna(row["blk"]) else 0.0
+            tov = float(row["tov"]) if pd.notna(row["tov"]) else 0.0
+            fg_pct = float(row["fg_pct"]) if pd.notna(row["fg_pct"]) else 0.0
+            fg3_pct = float(row["fg3_pct"]) if pd.notna(row["fg3_pct"]) else 0.0
+            ft_pct = float(row["ft_pct"]) if pd.notna(row["ft_pct"]) else 0.0
+            plus_minus = float(row["plus_minus"]) if pd.notna(row["plus_minus"]) else 0.0
+
+            print(
+                f"  {row['full_name']}: "
+                f"MIN {minutes:.1f} | "
+                f"PTS {points:.1f} | AST {ast:.1f} | REB {reb:.1f} | "
+                f"STL {stl:.1f} | BLK {blk:.1f} | TOV {tov:.1f} | "
+                f"FG% {fg_pct:.3f} | 3PT% {fg3_pct:.3f} | FT% {ft_pct:.3f} | +/- {plus_minus:.1f}"
+            )
+
+
+def main():
+    output_filename = f"lakers_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    tee = Tee(output_filename)
+    sys.stdout = tee
+
+    try:
+        print(f"Saving output to: {output_filename}")
+
+        print("Rebuilding table with new schema...")
+        recreate_table()
+
+        print("Fetching player logs...")
+        df = fetch_all_players_logs()
+        insert_logs(df)
+
+        print("Building teammate context from database...")
+        update_teammate_context_from_db()
+
+        for player_name in PLAYER_NAMES:
+            show_last_games_from_db(player_name, limit=10)
+
+        print("\nFetching Lakers team stats...")
+        team_stats = fetch_team_stats(TEAM_NAME, TEAM_SEASON)
+        print_team_stats(team_stats)
+
+        print("\nAnalyzing every player's average contribution to team stats...")
+        show_full_team_impact(team_stats, df)
+
+        print("\nShowing this season's head-to-head games versus the next opponent...")
+        show_head_to_head_this_season(df, season=TEAM_SEASON)
+
+        print(f"\nDone. Output was saved to: {output_filename}")
+
+    finally:
+        sys.stdout.flush()
+        sys.stdout = tee.stdout
+        tee.close()
+
+
+if __name__ == "__main__":
+    main()
