@@ -29,8 +29,10 @@ DB_PATH = "rockets_predictions.db" # database to store all rockets data.
 
 
 TABLE = "player_game_logs" # Stores player game-by-game stats
-HOUSTON = "Houston Rockets" # Tells my code which team to pull data for
+TEAM = "TEAM Rockets" # Tells my code which team to pull data for
 
+
+# It figures out the current NBA season automatically based on today’s date
 def get_current_season():
     today = datetime.now()
     year = today.year
@@ -46,15 +48,16 @@ def get_current_season():
 
 
 
-TEAM_SEASON = get_current_season()
+CURRENT_YEAR = get_current_season()
 
 
 # Optional Settings
 
 # Extra rules for players (like skipping injured ones)
 INJURED_PLAYERS = [
-    # "Kevin Durant",
-    # "Fred VanVleet",
+    "Kevin Durant",   # questionable
+    "Steven Adams",   # out
+    "Fred VanVleet",  # out
 ]
 
 PLAYER_NAME_FALLBACKS = {
@@ -72,8 +75,8 @@ PLAYER_NAME_FALLBACKS = {
 
 # It gets a team’s roster for a season 
 # and returns only the players who are not in the injured players list.
-def get_active_players(HOUSTON: str, season: str, injured_players: list):
-    team_id = get_team_id(HOUSTON)
+def get_active_players(TEAM: str, season: str, injured_players: list):
+    team_id = get_team_id(TEAM)
 
     roster_df = commonteamroster.CommonTeamRoster(
         team_id=team_id,
@@ -81,7 +84,7 @@ def get_active_players(HOUSTON: str, season: str, injured_players: list):
     ).get_data_frames()[0]
 
     if roster_df.empty or "PLAYER" not in roster_df.columns:
-        raise ValueError(f"Could not fetch roster for {HOUSTON} in {season}.")
+        raise ValueError(f"Could not fetch roster for {TEAM} in {season}.")
 
     roster = roster_df["PLAYER"].dropna().astype(str).tolist()
 
@@ -180,12 +183,12 @@ def generate_seasons(current_season: str, num_years: int = 7):
     return seasons
 
 
-def get_team_id(HOUSTON: str) -> int:
+def get_team_id(TEAM: str) -> int:
     nba_teams = teams.get_teams()
     for team in nba_teams:
-        if team["full_name"].lower() == HOUSTON.lower():
+        if team["full_name"].lower() == TEAM.lower():
             return int(team["id"])
-    raise ValueError(f"Team '{HOUSTON}' not found.")
+    raise ValueError(f"Team '{TEAM}' not found.")
 
 
 
@@ -710,8 +713,8 @@ def show_last_games_from_db(player_name: str, limit: int = 5):
         )
 
 
-def fetch_team_stats(HOUSTON=HOUSTON, season=TEAM_SEASON):
-    team_id = get_team_id(HOUSTON)
+def fetch_team_stats(TEAM=TEAM, season=CURRENT_YEAR):
+    team_id = get_team_id(TEAM)
 
     try:
         base_df = leaguedashteamstats.LeagueDashTeamStats(
@@ -728,25 +731,25 @@ def fetch_team_stats(HOUSTON=HOUSTON, season=TEAM_SEASON):
             measure_type_detailed_defense="Advanced"
         ).get_data_frames()[0]
     except Exception as e:
-        print(f"Could not fetch team stats for {HOUSTON} ({season}): {e}")
+        print(f"Could not fetch team stats for {TEAM} ({season}): {e}")
         return None
 
     if base_df.empty or adv_df.empty:
-        print(f"No team stats returned for {HOUSTON} ({season}).")
+        print(f"No team stats returned for {TEAM} ({season}).")
         return None
 
     base_row = base_df[base_df["TEAM_ID"] == team_id]
     adv_row = adv_df[adv_df["TEAM_ID"] == team_id]
 
     if base_row.empty or adv_row.empty:
-        print(f"Could not locate {HOUSTON} in returned team stats.")
+        print(f"Could not locate {TEAM} in returned team stats.")
         return None
 
     base_row = base_row.iloc[0]
     adv_row = adv_row.iloc[0]
 
     return {
-        "HOUSTON": HOUSTON,
+        "TEAM": TEAM,
         "season": season,
         "gp": base_row.get("GP"),
         "wins": base_row.get("W"),
@@ -787,7 +790,7 @@ def print_team_stats(team_stats):
         return f"{float(v):.2f}"
 
     print("\n" + "=" * 100)
-    print(f"{team_stats['HOUSTON'].upper()} TEAM STATS ({team_stats['season']})")
+    print(f"{team_stats['TEAM'].upper()} TEAM STATS ({team_stats['season']})")
     print("=" * 100)
     print(f"Games Played       : {team_stats['gp']}")
     print(f"Record             : {team_stats['wins']}-{team_stats['losses']}")
@@ -888,7 +891,7 @@ def show_full_team_impact(team_stats, df, active_players):
 
 
 def main():
-    seasons = generate_seasons(TEAM_SEASON, num_years=7)
+    seasons = generate_seasons(CURRENT_YEAR, num_years=7)
     active_players = get_active_players()
 
     if not active_players:
@@ -897,8 +900,8 @@ def main():
 
     print("\nTEAM")
     print("-" * 50)
-    print(HOUSTON)
-    print(f"Season: {TEAM_SEASON}")
+    print(TEAM)
+    print(f"Season: {CURRENT_YEAR}")
 
     print("\nAUTO ROSTER")
     print("-" * 50)
@@ -976,15 +979,15 @@ def main():
 
     print("\nTEAM SCORE PREDICTION")
     print("-" * 50)
-    print(f"{HOUSTON} projected score: {team_score} pts")
+    print(f"{TEAM} projected score: {team_score} pts")
 
     print("\nRECENT GAME SNAPSHOT")
     print("-" * 50)
     for player in active_players[:5]:
         show_last_games_from_db(player, limit=3)
 
-    print(f"\nFetching {HOUSTON} team stats...")
-    team_stats = fetch_team_stats(HOUSTON, TEAM_SEASON)
+    print(f"\nFetching {TEAM} team stats...")
+    team_stats = fetch_team_stats(TEAM, CURRENT_YEAR)
     print_team_stats(team_stats)
 
     print("\nAnalyzing every player's average contribution to team stats...")
