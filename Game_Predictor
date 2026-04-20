@@ -1,0 +1,760 @@
+import ast
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+from sklearn.ensemble import ExtraTreesRegressor
+from nba_api.stats.static import teams
+from nba_api.stats.endpoints import leaguedashteamstats
+
+
+LAKERS_FILE = "Lakers.py"
+ROCKETS_FILE = "Rockets.py"
+
+LAKERS_DB = "nba_database.db"
+ROCKETS_DB = "rockets_predictions.db"
+TABLE = "player_game_logs"
+SEASON = "2025-26"
+
+# Lakers are the higher seed in this series
+HIGHER_SEED_TEAM = "Los Angeles Lakers"
+LOWER_SEED_TEAM = "Houston Rockets"
+
+# Playoff logic
+PLAYOFF_ROTATION_SIZE = 8
+PLAYOFF_MIN_AVG_MINUTES = 15.0
+RECENT_GAMES_FOR_ROTATION = 10
+RECENT_GAMES_FOR_INJURY_CHECK = 5
+
+BOX_STATS = ["points", "ast", "reb", "stl", "blk", "tov"]
+
+BASE_FEATURES = [
+    "numMinutes",
+    "points",
+    "ast",
+    "reb",
+    "stl",
+    "blk",
+    "tov",
+    "fg_pct",
+    "fg3_pct",
+    "ft_pct",
+    "plus_minus",
+    "tm_points_total",
+    "tm_ast_total",
+    "tm_reb_total",
+    "tm_minutes_total",
+    "tm_fg_pct",
+    "top_tm_points",
+    "second_tm_points",
+    "third_tm_points",
+    "top3_tm_points_total",
+    "player_team_points_share",
+]
+
+
+@dataclass
+class TeamConfig:
+    name: str
+    db_path: str
+    script_path: str
+    players: List[str]
+    manual_injured: List[str]
+
+
+def load_python_list_from_file(file_path: str, variable_name: str, default=None):
+    if default is None:
+        default = []
+
+    path = Path(file_path)
+    if not path.exists():
+        return default
+
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=file_path)
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == variable_name:
+                        value = ast.literal_eval(node.value)
+                        if isinstance(value, list):
+                            return value
+                        return default
+    except Exception:
+        return default
+
+    return default
+
+
+def load_team_configurations() -> Tuple[TeamConfig, TeamConfig]:
+    lakers = TeamConfig(
+        name="Los Angeles Lakers",
+        db_path=LAKERS_DB,
+        script_path=LAKERS_FILE,
+        players=load_python_list_from_file(LAKERS_FILE, "PLAYER_NAMES", []),
+        manual_injured=load_python_list_from_file(LAKERS_FILE, "INJURED_PLAYERS", []),
+    )
+
+    rockets = TeamConfig(
+        name="Houston Rockets",
+        db_path=ROCKETS_DB,
+        script_path=ROCKETS_FILE,
+        players=load_python_list_from_file(ROCKETS_FILE, "PLAYER_NAMES", []),
+        manual_injured=load_python_list_from_file(ROCKETS_FILE, "INJURED_PLAYERS", []),
+    )
+
+    return lakers, rockets
+
+
+def get_team_id(team_name: str) -> int:
+    for team in teams.get_teams():
+        if team["full_name"].lower() == team_name.lower():
+            return int(team["id"])
+    raise ValueError(f"Team '{team_name}' not found.")
+
+
+def fetch_team_base_stats(team_name: str, season: str) -> Dict[str, float]:
+    team_id = get_team_id(team_name)
+
+    df = leaguedashteamstats.LeagueDashTeamStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        per_mode_detailed="PerGame",
+        measure_type_detailed_defense="Base",
+    ).get_data_frames()[0]
+
+    row = df[df["TEAM_ID"] == team_id]
+    if row.empty:
+        raise ValueError(f"Could not find team stats for {team_name} in {season}.")
+
+    row = row.iloc[0]
+    return {
+        "points_per_game": float(row["PTS"]),
+        "assists_per_game": float(row["AST"]),
+        "rebounds_per_game": float(row["REB"]),
+        "steals_per_game": float(row["STL"]),
+        "blocks_per_game": float(row["BLK"]),
+        "turnovers_per_game": float(row["TOV"]),
+    }
+
+
+def load_team_data(db_path: str, players: List[str]) -> pd.DataFrame:
+    if not players:
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(db_path)
+    placeholders = ",".join(["?"] * len(players))
+
+    query = f"""
+        SELECT
+            game_id,
+            player_id,
+            full_name,
+            season,
+            game_date,
+            matchup,
+            wl,
+            numMinutes,
+            points,
+            ast,
+            reb,
+            stl,
+            blk,
+            tov,
+            fg_pct,
+            fg3_pct,
+            ft_pct,
+            plus_minus,
+            tm_points_total,
+            tm_ast_total,
+            tm_reb_total,
+            tm_minutes_total,
+            tm_fg_pct,
+            top_tm_points,
+            second_tm_points,
+            third_tm_points,
+            top3_tm_points_total,
+            player_team_points_share
+        FROM {TABLE}
+        WHERE full_name IN ({placeholders})
+        ORDER BY full_name, game_date
+    """
+
+    df = pd.read_sql_query(query, conn, params=players)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+
+    numeric_cols = [
+        "numMinutes", "points", "ast", "reb", "stl", "blk", "tov",
+        "fg_pct", "fg3_pct", "ft_pct", "plus_minus",
+        "tm_points_total", "tm_ast_total", "tm_reb_total", "tm_minutes_total",
+        "tm_fg_pct", "top_tm_points", "second_tm_points", "third_tm_points",
+        "top3_tm_points_total", "player_team_points_share",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["game_date"]).copy()
+    df = df.sort_values(["full_name", "game_date"]).reset_index(drop=True)
+    return df
+
+
+def detect_injuries_from_recent_participation(
+    df: pd.DataFrame,
+    players: List[str],
+    recent_team_games_window: int = RECENT_GAMES_FOR_INJURY_CHECK,
+) -> List[str]:
+    if df.empty:
+        return players.copy()
+
+    recent_games = (
+        df[["game_id", "game_date"]]
+        .drop_duplicates()
+        .sort_values("game_date", ascending=False)
+        .head(recent_team_games_window)
+    )
+    recent_ids = set(recent_games["game_id"].tolist())
+
+    injured = []
+    for player in players:
+        player_recent = df[
+            (df["full_name"] == player) &
+            (df["game_id"].isin(recent_ids))
+        ]
+        if player_recent.empty:
+            injured.append(player)
+
+    return injured
+
+
+def detect_playoff_rotation_players(
+    df: pd.DataFrame,
+    active_players: List[str],
+    recent_team_games_window: int = RECENT_GAMES_FOR_ROTATION,
+    min_avg_minutes: float = PLAYOFF_MIN_AVG_MINUTES,
+    max_players: int = PLAYOFF_ROTATION_SIZE,
+) -> List[str]:
+    if df.empty or not active_players:
+        return []
+
+    recent_games = (
+        df[["game_id", "game_date"]]
+        .drop_duplicates()
+        .sort_values("game_date", ascending=False)
+        .head(recent_team_games_window)
+    )
+    recent_ids = set(recent_games["game_id"].tolist())
+
+    recent_df = df[
+        (df["full_name"].isin(active_players)) &
+        (df["game_id"].isin(recent_ids))
+    ].copy()
+
+    if recent_df.empty:
+        return active_players[:max_players]
+
+    rotation = (
+        recent_df.groupby("full_name", as_index=False)
+        .agg(
+            recent_avg_minutes=("numMinutes", "mean"),
+            recent_games_played=("game_id", "nunique"),
+            recent_avg_points=("points", "mean"),
+        )
+        .sort_values(
+            ["recent_avg_minutes", "recent_games_played", "recent_avg_points"],
+            ascending=False,
+        )
+    )
+
+    rotation = rotation[rotation["recent_avg_minutes"] >= min_avg_minutes].copy()
+
+    if rotation.empty:
+        rotation = (
+            recent_df.groupby("full_name", as_index=False)
+            .agg(recent_avg_minutes=("numMinutes", "mean"))
+            .sort_values("recent_avg_minutes", ascending=False)
+            .head(max_players)
+        )
+    else:
+        rotation = rotation.head(max_players)
+
+    return rotation["full_name"].tolist()
+
+
+def add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+    group = df.groupby("full_name", group_keys=False)
+
+    for col in BASE_FEATURES:
+        df[f"{col}_last3"] = group[col].transform(
+            lambda s: s.shift(1).rolling(3, min_periods=1).mean()
+        )
+        df[f"{col}_last5"] = group[col].transform(
+            lambda s: s.shift(1).rolling(5, min_periods=1).mean()
+        )
+
+    df["games_played_before"] = group.cumcount()
+    df["is_home"] = df["matchup"].astype(str).str.contains("vs.", case=False, na=False).astype(int)
+    df["is_away"] = df["matchup"].astype(str).str.contains("@", na=False).astype(int)
+
+    for stat in BOX_STATS:
+        df[f"{stat}_per_min"] = df[stat] / df["numMinutes"].replace(0, pd.NA)
+
+    return df
+
+
+def get_feature_cols() -> List[str]:
+    cols = ["games_played_before", "is_home", "is_away"]
+    for col in BASE_FEATURES:
+        cols.append(f"{col}_last3")
+        cols.append(f"{col}_last5")
+    return cols
+
+
+def train_models(
+    df: pd.DataFrame,
+) -> Tuple[ExtraTreesRegressor | None, Dict[str, ExtraTreesRegressor], List[str], pd.DataFrame]:
+    if df.empty:
+        return None, {}, [], df
+
+    df = add_rolling_features(df)
+    feature_cols = get_feature_cols()
+
+    train_df = df[df["games_played_before"] >= 3].copy()
+    if train_df.empty:
+        return None, {}, feature_cols, df
+
+    X = train_df[feature_cols].copy()
+    X = X.fillna(X.mean(numeric_only=True)).fillna(0)
+
+    minute_model = None
+    y_minutes = pd.to_numeric(train_df["numMinutes"], errors="coerce")
+    valid_minutes = y_minutes.notna()
+    if valid_minutes.sum() >= 10:
+        minute_model = ExtraTreesRegressor(
+            n_estimators=300,
+            random_state=42,
+            min_samples_leaf=2,
+            n_jobs=-1,
+        )
+        minute_model.fit(X.loc[valid_minutes], y_minutes.loc[valid_minutes])
+
+    stat_models: Dict[str, ExtraTreesRegressor] = {}
+    for stat in BOX_STATS:
+        target_col = f"{stat}_per_min"
+        y = pd.to_numeric(train_df[target_col], errors="coerce")
+        valid = y.notna()
+
+        if valid.sum() < 10:
+            continue
+
+        model = ExtraTreesRegressor(
+            n_estimators=300,
+            random_state=42,
+            min_samples_leaf=2,
+            n_jobs=-1,
+        )
+        model.fit(X.loc[valid], y.loc[valid])
+        stat_models[stat] = model
+
+    return minute_model, stat_models, feature_cols, df
+
+
+def build_prediction_rows(
+    df: pd.DataFrame,
+    rotation_players: List[str],
+    feature_cols: List[str],
+    is_home: int,
+) -> pd.DataFrame:
+    rows = []
+
+    for player in rotation_players:
+        player_df = df[df["full_name"] == player].sort_values("game_date").copy()
+        if len(player_df) < 3:
+            continue
+
+        if float(player_df["numMinutes"].tail(8).mean()) < 10:
+            continue
+
+        row = {"full_name": player}
+        row["games_played_before"] = len(player_df)
+        row["is_home"] = is_home
+        row["is_away"] = 0 if is_home == 1 else 1
+
+        for base_col in BASE_FEATURES:
+            row[f"{base_col}_last3"] = float(player_df[base_col].tail(3).mean())
+            row[f"{base_col}_last5"] = float(player_df[base_col].tail(5).mean())
+
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    pred_df = pd.DataFrame(rows)
+    for col in feature_cols:
+        if col not in pred_df.columns:
+            pred_df[col] = 0.0
+
+    pred_df = pred_df[["full_name"] + feature_cols].copy()
+    pred_df[feature_cols] = pred_df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    return pred_df
+
+
+def allocate_playoff_minutes(
+    minute_predictions: pd.DataFrame,
+    recent_df: pd.DataFrame,
+    total_minutes: float = 240.0,
+) -> pd.DataFrame:
+    if minute_predictions.empty:
+        return minute_predictions
+
+    recent_minutes = (
+        recent_df.groupby("full_name", as_index=False)
+        .agg(recent_avg_minutes=("numMinutes", "mean"))
+    )
+
+    merged = minute_predictions.merge(recent_minutes, on="full_name", how="left")
+    merged["recent_avg_minutes"] = pd.to_numeric(merged["recent_avg_minutes"], errors="coerce").fillna(0)
+
+    merged["raw_minutes"] = 0.60 * merged["pred_minutes"] + 0.40 * merged["recent_avg_minutes"]
+    merged["raw_minutes"] = merged["raw_minutes"].clip(lower=10, upper=42)
+
+    total_raw = float(merged["raw_minutes"].sum())
+    if total_raw > 0:
+        merged["numMinutes"] = merged["raw_minutes"] * (total_minutes / total_raw)
+    else:
+        merged["numMinutes"] = 0.0
+
+    merged["numMinutes"] = merged["numMinutes"].clip(lower=0, upper=42).round(1)
+    return merged[["full_name", "numMinutes"]].copy()
+
+
+def predict_player_box_stats(
+    minute_model: ExtraTreesRegressor | None,
+    stat_models: Dict[str, ExtraTreesRegressor],
+    pred_df: pd.DataFrame,
+    feature_cols: List[str],
+    full_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if pred_df.empty:
+        return pd.DataFrame()
+
+    X_pred = pred_df[feature_cols].copy()
+    result = pred_df[["full_name"]].copy()
+
+    if minute_model is not None:
+        pred_minutes = minute_model.predict(X_pred)
+        result["pred_minutes"] = [max(0.0, float(x)) for x in pred_minutes]
+    else:
+        fallback = (
+            full_df.groupby("full_name")["numMinutes"]
+            .mean()
+            .reindex(result["full_name"])
+            .fillna(20.0)
+            .tolist()
+        )
+        result["pred_minutes"] = fallback
+
+    recent_df = full_df[full_df["full_name"].isin(result["full_name"])].copy()
+    allocated = allocate_playoff_minutes(result, recent_df)
+    result = result.merge(allocated, on="full_name", how="left")
+
+    for stat in BOX_STATS:
+        if stat in stat_models:
+            rates = stat_models[stat].predict(X_pred)
+            rates = [max(0.0, float(x)) for x in rates]
+        else:
+            fallback_rates = (
+                full_df.groupby("full_name")
+                .apply(lambda g: float(g[stat].sum()) / max(float(g["numMinutes"].sum()), 1.0))
+                .reindex(result["full_name"])
+                .fillna(0.0)
+                .tolist()
+            )
+            rates = fallback_rates
+
+        result[stat] = [round(r * m, 1) for r, m in zip(rates, result["numMinutes"])]
+
+    return result.drop(columns=["pred_minutes"])
+
+
+def enrich_with_shooting_estimates(player_preds: pd.DataFrame, source_df: pd.DataFrame) -> pd.DataFrame:
+    if player_preds.empty:
+        return player_preds
+
+    shooting = (
+        source_df.groupby("full_name")[["fg_pct", "fg3_pct", "ft_pct"]]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+
+    result = player_preds.merge(shooting, on="full_name", how="left")
+    for col in ["fg_pct", "fg3_pct", "ft_pct"]:
+        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).round(3)
+
+    return result
+
+
+def calibrate_team_predictions(
+    player_preds: pd.DataFrame,
+    team_base_stats: Dict[str, float],
+    game_adjustment: float = 1.0,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    if player_preds.empty:
+        zero = {s: 0.0 for s in BOX_STATS}
+        return player_preds, zero
+
+    calibrated = player_preds.copy()
+
+    mapping = {
+        "points": "points_per_game",
+        "ast": "assists_per_game",
+        "reb": "rebounds_per_game",
+        "stl": "steals_per_game",
+        "blk": "blocks_per_game",
+        "tov": "turnovers_per_game",
+    }
+
+    for stat, team_key in mapping.items():
+        raw_total = float(calibrated[stat].sum())
+        target_total = float(team_base_stats[team_key]) * game_adjustment
+
+        if raw_total > 0:
+            scale = target_total / raw_total
+            scale = max(0.80, min(1.20, scale))
+            calibrated[stat] = calibrated[stat] * scale
+
+    for stat in BOX_STATS:
+        calibrated[stat] = calibrated[stat].round(1)
+
+    totals = {
+        "points": round(float(calibrated["points"].sum()), 1),
+        "ast": round(float(calibrated["ast"].sum()), 1),
+        "reb": round(float(calibrated["reb"].sum()), 1),
+        "stl": round(float(calibrated["stl"].sum()), 1),
+        "blk": round(float(calibrated["blk"].sum()), 1),
+        "tov": round(float(calibrated["tov"].sum()), 1),
+    }
+
+    return calibrated, totals
+
+
+def get_series_home_pattern(higher_seed_team: str, lower_seed_team: str) -> List[str]:
+    # 2-2-1-1-1
+    return [
+        higher_seed_team,  # Game 1
+        higher_seed_team,  # Game 2
+        lower_seed_team,   # Game 3
+        lower_seed_team,   # Game 4
+        higher_seed_team,  # Game 5
+        lower_seed_team,   # Game 6
+        higher_seed_team,  # Game 7
+    ]
+
+
+def print_loaded_config(team: TeamConfig):
+    print("\n" + "=" * 100)
+    print(f"{team.name.upper()} CONFIG")
+    print("=" * 100)
+    print(f"Loaded players from: {team.script_path}")
+    print(f"Players found: {len(team.players)}")
+    print("Manual injured list:")
+    if team.manual_injured:
+        for p in team.manual_injured:
+            print(f"  - {p}")
+    else:
+        print("  - None listed")
+
+
+def print_team_availability(team_name: str, combined_injured: List[str], rotation_players: List[str]):
+    print("\n" + "-" * 100)
+    print(f"{team_name.upper()} PLAYOFF AVAILABILITY")
+    print("-" * 100)
+
+    print("Unavailable / likely out:")
+    if combined_injured:
+        for p in combined_injured:
+            print(f"  - {p}")
+    else:
+        print("  - None")
+
+    print("Playoff rotation used:")
+    if rotation_players:
+        for p in rotation_players:
+            print(f"  - {p}")
+    else:
+        print("  - None")
+
+
+def predict_team(
+    config: TeamConfig,
+    is_home: int,
+    game_adjustment: float,
+) -> Tuple[pd.DataFrame, Dict[str, float], List[str], List[str]]:
+    df_all = load_team_data(config.db_path, config.players)
+    if df_all.empty:
+        print(f"No data found for {config.name}.")
+        return pd.DataFrame(), {s: 0.0 for s in BOX_STATS}, [], []
+
+    auto_injured = detect_injuries_from_recent_participation(df_all, config.players)
+    combined_injured = sorted(set(config.manual_injured) | set(auto_injured))
+    healthy_players = [p for p in config.players if p not in combined_injured]
+
+    rotation_players = detect_playoff_rotation_players(
+        df_all,
+        healthy_players,
+        recent_team_games_window=RECENT_GAMES_FOR_ROTATION,
+        min_avg_minutes=PLAYOFF_MIN_AVG_MINUTES,
+        max_players=PLAYOFF_ROTATION_SIZE,
+    )
+
+    print_team_availability(config.name, combined_injured, rotation_players)
+
+    df_active = load_team_data(config.db_path, rotation_players)
+    if df_active.empty:
+        print(f"No active playoff-rotation data found for {config.name}.")
+        return pd.DataFrame(), {s: 0.0 for s in BOX_STATS}, combined_injured, rotation_players
+
+    minute_model, stat_models, feature_cols, full_df = train_models(df_active)
+    pred_rows = build_prediction_rows(full_df, rotation_players, feature_cols, is_home=is_home)
+    player_preds = predict_player_box_stats(minute_model, stat_models, pred_rows, feature_cols, full_df)
+    player_preds = enrich_with_shooting_estimates(player_preds, full_df)
+
+    team_base_stats = fetch_team_base_stats(config.name, SEASON)
+    player_preds, totals = calibrate_team_predictions(player_preds, team_base_stats, game_adjustment=game_adjustment)
+
+    return player_preds, totals, combined_injured, rotation_players
+
+
+def print_team_prediction(team_name: str, player_preds: pd.DataFrame, totals: Dict[str, float]):
+    print(
+        f"TEAM TOTALS -> "
+        f"PTS: {totals['points']:.1f} | AST: {totals['ast']:.1f} | REB: {totals['reb']:.1f} | "
+        f"STL: {totals['stl']:.1f} | BLK: {totals['blk']:.1f} | TOV: {totals['tov']:.1f}"
+    )
+
+    if player_preds.empty:
+        print("No player predictions available.")
+        return
+
+    ordered = player_preds.sort_values(["numMinutes", "points"], ascending=False).reset_index(drop=True)
+
+    print("PLAYER PREDICTIONS")
+    for _, row in ordered.iterrows():
+        print(
+            f"  {row['full_name']}: "
+            f"MIN {row['numMinutes']:.1f} | "
+            f"PTS {row['points']:.1f} | AST {row['ast']:.1f} | REB {row['reb']:.1f} | "
+            f"STL {row['stl']:.1f} | BLK {row['blk']:.1f} | TOV {row['tov']:.1f} | "
+            f"FG% {row['fg_pct']:.3f} | 3PT% {row['fg3_pct']:.3f} | FT% {row['ft_pct']:.3f}"
+        )
+
+
+def simulate_series(lakers: TeamConfig, rockets: TeamConfig):
+    home_pattern = get_series_home_pattern(HIGHER_SEED_TEAM, LOWER_SEED_TEAM)
+
+    lakers_wins = 0
+    rockets_wins = 0
+    series_results = []
+
+    # mild game-to-game variability by slot
+    game_adjustments = [1.00, 0.98, 1.01, 0.99, 1.02, 1.00, 0.97]
+
+    for game_num, home_team in enumerate(home_pattern, start=1):
+        if lakers_wins == 4 or rockets_wins == 4:
+            break
+
+        print("\n" + "=" * 100)
+        print(f"GAME {game_num}")
+        print("=" * 100)
+
+        lakers_is_home = 1 if home_team == "Los Angeles Lakers" else 0
+        rockets_is_home = 1 if home_team == "Houston Rockets" else 0
+
+        print(f"Home team: {home_team}")
+
+        game_adj = game_adjustments[game_num - 1]
+
+        lakers_player_preds, lakers_totals, _, _ = predict_team(
+            lakers,
+            is_home=lakers_is_home,
+            game_adjustment=game_adj + (0.015 if lakers_is_home else -0.015),
+        )
+
+        rockets_player_preds, rockets_totals, _, _ = predict_team(
+            rockets,
+            is_home=rockets_is_home,
+            game_adjustment=game_adj + (0.015 if rockets_is_home else -0.015),
+        )
+
+        # prevent ties
+        if lakers_totals["points"] == rockets_totals["points"]:
+            if lakers_is_home:
+                lakers_totals["points"] += 1.0
+            else:
+                rockets_totals["points"] += 1.0
+
+        if lakers_totals["points"] > rockets_totals["points"]:
+            winner = "Los Angeles Lakers"
+            lakers_wins += 1
+        else:
+            winner = "Houston Rockets"
+            rockets_wins += 1
+
+        print(f"Predicted Winner: {winner}")
+        print(f"Predicted Score: Lakers {lakers_totals['points']:.1f} - Rockets {rockets_totals['points']:.1f}")
+        print("-" * 100)
+        print("LAKERS")
+        print_team_prediction("Los Angeles Lakers", lakers_player_preds, lakers_totals)
+        print("-" * 100)
+        print("ROCKETS")
+        print_team_prediction("Houston Rockets", rockets_player_preds, rockets_totals)
+
+        series_results.append({
+            "game": game_num,
+            "home_team": home_team,
+            "winner": winner,
+            "lakers_score": lakers_totals["points"],
+            "rockets_score": rockets_totals["points"],
+            "lakers_totals": lakers_totals,
+            "rockets_totals": rockets_totals,
+        })
+
+        print("-" * 100)
+        print(f"SERIES SCORE -> Lakers {lakers_wins} - Rockets {rockets_wins}")
+
+    print("\n" + "=" * 100)
+    print("SERIES PREDICTION")
+    print("=" * 100)
+    print(f"Predicted final series score: Lakers {lakers_wins} - Rockets {rockets_wins}")
+
+    if lakers_wins > rockets_wins:
+        print(f"Predicted series winner: Los Angeles Lakers in {lakers_wins + rockets_wins}")
+    else:
+        print(f"Predicted series winner: Houston Rockets in {lakers_wins + rockets_wins}")
+
+    return series_results
+
+
+def main():
+    lakers, rockets = load_team_configurations()
+
+    print_loaded_config(lakers)
+    print_loaded_config(rockets)
+
+    simulate_series(lakers, rockets)
+
+
+if __name__ == "__main__":
+    main()
